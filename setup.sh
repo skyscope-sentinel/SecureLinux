@@ -61,20 +61,39 @@ parted -s /dev/sdb mklabel gpt
 parted -s /dev/sdb mkpart primary 1MiB 100%  # LVM
 parted -s /dev/sdb set 1 lvm on
 
-# Step 3: Set Up LUKS2 Encryption (Post-Quantum Secure)
+# Step 3: Set Up LUKS2 Encryption (Prompt for Passphrase)
 echo "Setting up LUKS2 encryption..."
+mkdir -p /tmp/luks-passphrases
 for disk in /dev/nvme0n1p2 /dev/nvme1n1p1 /dev/sda1 /dev/sdb1; do
-    cryptsetup luksFormat --type luks2 --cipher serpent-xts-plain64 --key-size 512 --hash sha512 --pbkdf pbkdf2 --iter-time 10000 "$disk" <<EOF
-YES
-$(head -c 32 /dev/urandom | base64)
-$(head -c 32 /dev/urandom | base64)
-EOF
-    cryptsetup open "$disk" "crypt$(basename $disk)"
+    echo "Enter passphrase for $disk (minimum 20 characters):"
+    read -s passphrase
+    while [ ${#passphrase} -lt 20 ]; do
+        echo "Passphrase must be at least 20 characters long. Try again:"
+        read -s passphrase
+    done
+    echo
+    echo "Confirm passphrase for $disk:"
+    read -s passphrase_confirm
+    echo
+    while [ "$passphrase" != "$passphrase_confirm" ]; do
+        echo "Passphrases do not match. Try again:"
+        echo "Enter passphrase for $disk:"
+        read -s passphrase
+        echo
+        echo "Confirm passphrase for $disk:"
+        read -s passphrase_confirm
+        echo
+    done
+    echo -n "$passphrase" > "/tmp/luks-passphrases/$(basename $disk).pass"
+    echo "Formatting $disk with LUKS..."
+    echo -n "$passphrase" | cryptsetup luksFormat --type luks2 --cipher serpent-xts-plain64 --key-size 512 --hash sha512 --pbkdf pbkdf2 --iter-time 10000 "$disk" -
+    echo "Opening $disk..."
+    echo -n "$passphrase" | cryptsetup open "$disk" "crypt$(basename $disk)" -
 done
-cryptsetup luksHeaderBackup /dev/nvme0n1p2 --header-backup-file /root/luks-header-nvme0n1.bin
-cryptsetup luksHeaderBackup /dev/nvme1n1p1 --header-backup-file /root/luks-header-nvme1n1.bin
-cryptsetup luksHeaderBackup /dev/sda1 --header-backup-file /root/luks-header-sda.bin
-cryptsetup luksHeaderBackup /dev/sdb1 --header-backup-file /root/luks-header-sdb.bin
+# Backup LUKS headers
+for disk in /dev/nvme0n1p2 /dev/nvme1n1p1 /dev/sda1 /dev/sdb1; do
+    cryptsetup luksHeaderBackup "$disk" --header-backup-file "/root/luks-header-$(basename $disk).bin"
+done
 
 # Step 4: Configure LVM and Btrfs
 echo "Configuring LVM and Btrfs..."
@@ -112,7 +131,7 @@ swapon /dev/vgroot/swap
 
 # Step 5: Install Base System
 echo "Installing base system..."
-pacstrap /mnt base linux linux-firmware intel-ucode btrfs-progs lvm2 cryptsetup grub efibootmgr networkmanager vim yubikey-manager yubico-piv-tool openssh pam-u2f base-devel git cmake python-pip libvirt virt-install qemu-full docker ufw
+pacstrap /mnt base linux linux-firmware intel-ucode btrfs-progs lvm2 cryptsetup grub efibootmgr networkmanager vim yubikey-manager yubico-piv-tool openssh pam-u2f base-devel git cmake python-pip libvirt virt-install qemu-full docker ufw apparmor
 genfstab -U /mnt >> /mnt/etc/fstab
 sed -i 's/subvolid=[0-9]*/subvol=@/' /mnt/etc/fstab
 
@@ -146,8 +165,26 @@ mkinitcpio -P
 # Set Root User
 usermod -l skyscope-research root
 usermod -d /root -m skyscope-research
-echo "skyscope-research:$(head -c 32 /dev/urandom | base64)" | chpasswd
-echo "Root password set. Store this securely: $(grep skyscope-research /etc/shadow | cut -d: -f2)"
+echo "Enter password for skyscope-research (minimum 20 characters):"
+read -s root_passphrase
+while [ ${#root_passphrase} -lt 20 ]; do
+    echo "Password must be at least 20 characters long. Try again:"
+    read -s root_passphrase
+done
+echo
+echo "Confirm password for skyscope-research:"
+read -s root_passphrase_confirm
+echo
+while [ "$root_passphrase" != "$root_passphrase_confirm" ]; do
+    echo "Passwords do not match. Try again:"
+    echo "Enter password for skyscope-research:"
+    read -s root_passphrase
+    echo
+    echo "Confirm password for skyscope-research:"
+    read -s root_passphrase_confirm
+    echo
+done
+echo "skyscope-research:$root_passphrase" | chpasswd
 
 # Install Additional Dependencies
 pacman -S --noconfirm rustup
@@ -199,6 +236,8 @@ CONFIG_KVM_INTEL=y
 CONFIG_X86_X2APIC=y
 CONFIG_LOCALVERSION="-quantum-powerhouse"
 CONFIG_MODULE_COMPRESS_XZ=y
+CONFIG_SECURITY_APPARMOR=y
+CONFIG_DEFAULT_SECURITY_APPARMOR=y
 EOC
 make olddefconfig
 mkdir -p drivers/vquantum
@@ -206,10 +245,21 @@ cat <<EOC > drivers/vquantum/vquantum_hybrid.c
 #include <linux/module.h>
 #include <linux/smp.h>
 #include <linux/sched.h>
+#include <linux/random.h>
 static char *ssd_path = "/mnt/nvme0n1/hybrid";
 module_param(ssd_path, charp, 0644);
 static int __init vquantum_hybrid_init(void) {
     printk(KERN_INFO "VQuantum Hybrid: 900 GB at %s, %d cores\n", ssd_path, num_online_cpus());
+    // Seed random number generator with quantum data
+    if (system("python3 /opt/quantum_task.py > /dev/null") == 0) {
+        char buffer[32];
+        struct file *f = filp_open("/mnt/nvme0n1/quantum/nonce_list.bin", O_RDONLY, 0);
+        if (!IS_ERR(f)) {
+            kernel_read(f, buffer, 32, &f->f_pos);
+            add_device_randomness(buffer, 32);
+            filp_close(f, NULL);
+        }
+    }
     return 0;
 }
 static void __exit vquantum_hybrid_exit(void) {
@@ -280,7 +330,7 @@ systemctl restart sshd
 grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
 cat <<EOC > /etc/default/grub
 GRUB_ENABLE_CRYPTODISK=y
-GRUB_CMDLINE_LINUX_DEFAULT="quiet splash intel_pstate=active"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash intel_pstate=active apparmor=1 security=apparmor"
 GRUB_CMDLINE_LINUX="cryptdevice=UUID=$(blkid -s UUID -o value /dev/nvme0n1p2):vgroot root=/dev/vgroot/root"
 EOC
 GRUB_PW_HASH=$(echo -e "password\npassword" | grub-mkpasswd-pbkdf2 | grep -o "grub.pbkdf2.sha512.*")
@@ -312,6 +362,7 @@ pacman -S --noconfirm sbctl
 sbctl create-keys
 sbctl enroll-keys -m
 sbctl sign -s /boot/EFI/GRUB/grubx64.efi
+systemctl enable apparmor
 
 # Quantum and Storj Setup
 mkdir -p /mnt/nvme0n1/hybrid /mnt/nvme0n1/quantum /mnt/sdb/storj_data /mnt/sdb/storj_identity
@@ -342,10 +393,11 @@ for i in $(seq 1 $VM_COUNT); do
         --features vmx=on
 done
 
-# Hybrid Buffer
+# Hybrid Buffer (Enhanced for System-Wide Use)
 cat <<EOC > /opt/vquantum_hybrid.rs
 use std::fs::{remove_file, File};
 use std::io::{Read, Write};
+use std::process::Command;
 const SSD_HYBRID: &str = "/mnt/nvme0n1/hybrid";
 const SSD_QUANTUM: &str = "/mnt/nvme0n1/quantum";
 const BLOCKS: usize = 20;
@@ -356,6 +408,8 @@ fn process_block(block_id: usize) {
     let chunk = data.chunks(data.len() / BLOCKS).nth(block_id % BLOCKS).unwrap();
     let path = format!("{}/block_{}.bin", SSD_HYBRID, block_id);
     File::create(&path).unwrap().write_all(chunk).unwrap();
+    // Feed quantum data into system entropy pool
+    Command::new("rngd").arg("-r").arg(&path).arg("-o").arg("/dev/random").status().unwrap();
     remove_file(&path).unwrap();
 }
 fn main() {
@@ -367,13 +421,14 @@ EOC
 rustc -O /opt/vquantum_hybrid.rs -o /opt/vquantum_hybrid
 chmod +x /opt/vquantum_hybrid
 
-# Quantum Simulator
+# Quantum Simulator (Enhanced for System-Wide Use)
 cat <<EOC > /opt/vquantum_qsim.py
 #!/usr/bin/env python3
 import cirq
 import qsimcirq
 import numpy as np
 import ollama
+import os
 SSD_QUANTUM = "/mnt/nvme0n1/quantum"
 QUBITS = 40
 circuit = cirq.Circuit()
@@ -387,6 +442,8 @@ while True:
     insight = ollama.chat(model="llama3", messages=[{"role": "user", "content": "Rank states for Kaspa and system tasks"}])
     ranked_states = sorted(states, key=lambda x: abs(x))[-10**5:]
     np.save(f"{SSD_QUANTUM}/nonce_list.bin", ranked_states)
+    # Feed quantum states into system entropy pool
+    os.system(f"rngd -r {SSD_QUANTUM}/nonce_list.bin -o /dev/random")
 EOC
 chmod +x /opt/vquantum_qsim.py
 
@@ -443,10 +500,12 @@ cat <<EOC > /etc/profile.d/quantum_boost.sh
 export QUANTUM_HYBRID_PATH="/mnt/nvme0n1/hybrid"
 export QUANTUM_QSIM_PATH="/mnt/nvme0n1/quantum"
 alias compute_boost="python3 /opt/quantum_task.py"
+# Preload quantum library for all processes
+export LD_PRELOAD="/usr/local/lib/libquantum_boost.so"
 EOC
 chmod +x /etc/profile.d/quantum_boost.sh
 
-# Tool Integration
+# Quantum Task Integration (Enhanced for System-Wide Use)
 cat <<EOC > /opt/quantum_task.py
 #!/usr/bin/env python3
 import numpy as np
@@ -473,8 +532,22 @@ if __name__ == "__main__":
     hybrid_result = hybrid_task()
     quantum_result = quantum_task()
     print(f"Hybrid Boost: {hybrid_result}, Quantum Boost: {quantum_result}")
+    # Optimize system scheduling with quantum data
+    os.system("sysctl -w kernel.sched_quantum_boost=$(echo $quantum_result | cut -d. -f1)")
 EOC
 chmod +x /opt/quantum_task.py
+
+# Quantum Boost Library (for LD_PRELOAD)
+cat <<EOC > /root/quantum_boost.c
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+void __attribute__((constructor)) quantum_boost_init(void) {
+    system("python3 /opt/quantum_task.py > /dev/null");
+    setenv("QUANTUM_BOOST", "1", 1);
+}
+EOC
+gcc -shared -fPIC /root/quantum_boost.c -o /usr/local/lib/libquantum_boost.so
 
 # Services
 cat <<EOC > /etc/systemd/system/vquantum_hybrid.service
