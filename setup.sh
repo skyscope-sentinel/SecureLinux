@@ -2,17 +2,30 @@
 
 set -e
 
+# Step 0: Tamper Prevention and Script Integrity Check
+echo "Verifying script integrity..."
+# Pre-compute the SHA256 checksum of this script (excluding this comment block)
+# To generate the checksum, run: grep -v "^#" install-arch-skyscope-secure.sh | sha256sum
+EXPECTED_CHECKSUM="your_precomputed_sha256_checksum_here"
+CURRENT_CHECKSUM=$(grep -v "^#" "$0" | sha256sum | awk '{print $1}')
+if [ "$CURRENT_CHECKSUM" != "$EXPECTED_CHECKSUM" ]; then
+    echo "Error: Script has been modified! Expected SHA256: $EXPECTED_CHECKSUM, Got: $CURRENT_CHECKSUM"
+    exit 1
+fi
+
+# Disable network access to prevent remote interference
+echo "Disabling network access during installation..."
+systemctl stop dhcpcd || true
+ip link set enp3s0 down || true
+ufw enable || true
+ufw default deny incoming || true
+ufw default deny outgoing || true
+
 # Variables
 SSD_OS="/mnt/nvme0n1"  # 931.5GB for OS and quantum
 SSD_HYBRID="/mnt/nvme0n1/hybrid"
 SSD_QUANTUM="/mnt/nvme0n1/quantum"
-SSD_STORJ="/mnt/sdb"  # 931.5GB for Storj
 WORK_DIR="/root/quantum_powerhouse"
-VM_DIR="$WORK_DIR/vms"
-VM_COUNT=10
-ISO_URL="https://releases.ubuntu.com/24.04/ubuntu-24.04-live-server-amd64.iso"
-STORJ_EMAIL="caseyjay101@outlook.com"
-ETHERNET="enp3s0"
 
 # Step 1: Verify Disk Setup
 echo "Verifying disk setup..."
@@ -29,10 +42,10 @@ if cryptsetup status wipe0n1 >/dev/null 2>&1 || cryptsetup status wipe1n1 >/dev/
 fi
 for disk in /dev/nvme0n1 /dev/nvme1n1 /dev/sda /dev/sdb; do
     if [ -n "$(blkid $disk)" ]; then
-        echo "Disk $disk appears to have partitions/filesystems. Assuming wipe was successful."
-    else
-        echo "Error: Disk $disk not wiped properly!"
-        exit 1
+        echo "Disk $disk appears to have partitions/filesystems. Wiping..."
+        cryptsetup open --type plain -d /dev/urandom $disk wipe_$(basename $disk)
+        dd if=/dev/zero of=/dev/mapper/wipe_$(basename $disk) bs=4M status=progress
+        cryptsetup close wipe_$(basename $disk)
     fi
 done
 
@@ -56,10 +69,18 @@ parted -s /dev/sda mklabel gpt
 parted -s /dev/sda mkpart primary 1MiB 100%  # LVM
 parted -s /dev/sda set 1 lvm on
 
-# /dev/sdb (931.5GB): Storj
+# /dev/sdb (931.5GB): Additional storage
 parted -s /dev/sdb mklabel gpt
 parted -s /dev/sdb mkpart primary 1MiB 100%  # LVM
 parted -s /dev/sdb set 1 lvm on
+
+# Verify partitioning
+for disk in /dev/nvme0n1 /dev/nvme1n1 /dev/sda /dev/sdb; do
+    if ! lsblk $disk | grep -q "part"; then
+        echo "Error: Partitioning failed for $disk!"
+        exit 1
+    fi
+done
 
 # Step 3: Set Up LUKS2 Encryption (Prompt for Passphrase)
 echo "Setting up LUKS2 encryption..."
@@ -86,13 +107,22 @@ for disk in /dev/nvme0n1p2 /dev/nvme1n1p1 /dev/sda1 /dev/sdb1; do
     done
     echo -n "$passphrase" > "/tmp/luks-passphrases/$(basename $disk).pass"
     echo "Formatting $disk with LUKS..."
-    echo -n "$passphrase" | cryptsetup luksFormat --type luks2 --cipher serpent-xts-plain64 --key-size 512 --hash sha512 --pbkdf pbkdf2 --iter-time 10000 "$disk" -
+    echo -n "$passphrase" | cryptsetup luksFormat --type luks2 --cipher aes-xts-plain64 --key-size 512 --hash sha512 --pbkdf pbkdf2 --iter-time 10000 "$disk" -
     echo "Opening $disk..."
     echo -n "$passphrase" | cryptsetup open "$disk" "crypt$(basename $disk)" -
+    # Verify LUKS setup
+    if ! cryptsetup status "crypt$(basename $disk)" >/dev/null 2>&1; then
+        echo "Error: Failed to open LUKS container for $disk!"
+        exit 1
+    fi
 done
 # Backup LUKS headers
 for disk in /dev/nvme0n1p2 /dev/nvme1n1p1 /dev/sda1 /dev/sdb1; do
     cryptsetup luksHeaderBackup "$disk" --header-backup-file "/root/luks-header-$(basename $disk).bin"
+    if [ ! -f "/root/luks-header-$(basename $disk).bin" ]; then
+        echo "Error: Failed to backup LUKS header for $disk!"
+        exit 1
+    fi
 done
 
 # Step 4: Configure LVM and Btrfs
@@ -104,16 +134,16 @@ pvcreate /dev/mapper/cryptsdb1
 vgcreate vgroot /dev/mapper/cryptnvme0n1p2
 vgcreate vgextra /dev/mapper/cryptnvme1n1p1
 vgcreate vghome /dev/mapper/cryptsda1
-vgcreate vgstorj /dev/mapper/cryptsdb1
+vgcreate vgextra2 /dev/mapper/cryptsdb1
 lvcreate -L 32G vgroot -n swap
 lvcreate -l 100%FREE vgroot -n root
 lvcreate -l 100%FREE vgextra -n extra
 lvcreate -l 100%FREE vghome -n home
-lvcreate -l 100%FREE vgstorj -n storj
+lvcreate -l 100%FREE vgextra2 -n extra2
 mkfs.btrfs -L root /dev/vgroot/root
 mkfs.btrfs -L extra /dev/vgextra/extra
 mkfs.btrfs -L home /dev/vghome/home
-mkfs.btrfs -L storj /dev/vgstorj/storj
+mkfs.btrfs -L extra2 /dev/vgextra2/extra2
 mount /dev/vgroot/root /mnt
 btrfs subvolume create /mnt/@
 btrfs subvolume create /mnt/@snapshots
@@ -128,10 +158,28 @@ mount -o subvol=@snapshots,compress=zstd,ssd,noatime /dev/vgroot/root /mnt/.snap
 mount /dev/nvme0n1p1 /mnt/boot
 mkswap /dev/vgroot/swap
 swapon /dev/vgroot/swap
+# Verify mounts
+if ! mount | grep -q "/mnt type btrfs"; then
+    echo "Error: Failed to mount root filesystem!"
+    exit 1
+fi
 
 # Step 5: Install Base System
 echo "Installing base system..."
-pacstrap /mnt base linux linux-firmware intel-ucode btrfs-progs lvm2 cryptsetup grub efibootmgr networkmanager vim yubikey-manager yubico-piv-tool openssh pam-u2f base-devel git cmake python-pip libvirt virt-install qemu-full docker ufw apparmor
+# Temporarily enable network for package installation
+ip link set enp3s0 up
+dhcpcd enp3s0
+pacstrap /mnt base linux linux-firmware intel-ucode btrfs-progs lvm2 cryptsetup grub efibootmgr networkmanager vim yubikey-manager yubico-piv-tool openssh pam-u2f base-devel git cmake python-pip libvirt virt-install qemu-full ufw apparmor
+# Verify package installation
+for pkg in base linux linux-firmware intel-ucode btrfs-progs lvm2 cryptsetup grub efibootmgr networkmanager vim yubikey-manager yubico-piv-tool openssh pam-u2f base-devel git cmake python-pip libvirt virt-install qemu-full ufw apparmor; do
+    if ! pacman -Q $pkg >/dev/null 2>&1; then
+        echo "Error: Failed to install package $pkg!"
+        exit 1
+    fi
+done
+# Disable network again
+ip link set enp3s0 down
+systemctl stop dhcpcd || true
 genfstab -U /mnt >> /mnt/etc/fstab
 sed -i 's/subvolid=[0-9]*/subvol=@/' /mnt/etc/fstab
 
@@ -143,24 +191,35 @@ set -e
 # Timezone and Clock
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 hwclock --systohc
+if [ "$(date +%Z)" != "UTC" ]; then
+    echo "Error: Failed to set timezone to UTC!"
+    exit 1
+fi
 
 # Locale
 echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
 locale-gen
 echo "LANG=en_US.UTF-8" > /etc/locale.conf
+if ! locale | grep -q "LANG=en_US.UTF-8"; then
+    echo "Error: Failed to set locale!"
+    exit 1
+fi
 
 # Hostname
 echo "skyscope-research" > /etc/hostname
 echo "127.0.0.1 localhost" >> /etc/hosts
 echo "::1 localhost" >> /etc/hosts
 echo "127.0.1.1 skyscope-research.local skyscope-research" >> /etc/hosts
+if ! grep -q "skyscope-research" /etc/hostname; then
+    echo "Error: Failed to set hostname!"
+    exit 1
+fi
 
 # mkinitcpio
 cat <<EOC > /etc/mkinitcpio.conf
-MODULES=(btrfs crc32c-intel serpent)
+MODULES=(btrfs crc32c)
 HOOKS=(base udev autodetect keyboard keymap modconf block encrypt lvm2 filesystems fsck)
 EOC
-mkinitcpio -P
 
 # Set Root User
 usermod -l skyscope-research root
@@ -187,6 +246,9 @@ done
 echo "skyscope-research:$root_passphrase" | chpasswd
 
 # Install Additional Dependencies
+# Temporarily enable network for package installation
+ip link set enp3s0 up
+dhcpcd enp3s0
 pacman -S --noconfirm rustup
 rustup default stable
 pip install qiskit numpy
@@ -201,11 +263,22 @@ source /root/anaconda3/bin/activate
 # Install Ollama
 curl -fsSL https://ollama.com/install.sh | sh
 
+# Disable network again
+ip link set enp3s0 down
+systemctl stop dhcpcd || true
+
 # Kernel Compilation with Quantum and Security
 mkdir -p /root/quantum_powerhouse
 cd /root/quantum_powerhouse
 LATEST_RC=$(curl -s https://kernel.org | grep -oP 'linux-\d+\.\d+-rc\d+\.tar\.xz' | head -1 || echo "linux-6.9.tar.xz")
 curl -L "https://kernel.org/pub/linux/kernel/v6.x/$LATEST_RC" -o "$LATEST_RC"
+# Verify checksum of downloaded kernel (you should precompute this)
+EXPECTED_KERNEL_CHECKSUM="your_precomputed_kernel_sha256_checksum_here"
+CURRENT_KERNEL_CHECKSUM=$(sha256sum "$LATEST_RC" | awk '{print $1}')
+if [ "$CURRENT_KERNEL_CHECKSUM" != "$EXPECTED_KERNEL_CHECKSUM" ]; then
+    echo "Error: Kernel tarball checksum mismatch! Expected: $EXPECTED_KERNEL_CHECKSUM, Got: $CURRENT_KERNEL_CHECKSUM"
+    exit 1
+fi
 tar -xf "$LATEST_RC"
 cd "${LATEST_RC%.tar.xz}"
 cp "/boot/config-$(uname -r)" .config || curl -L https://raw.githubusercontent.com/archlinux/svntogit-packages/packages/linux/repos/core-x86_64/config -o .config
@@ -225,6 +298,7 @@ CONFIG_CRYPTO_KYBER=y
 CONFIG_CRYPTO_DILITHIUM=y
 CONFIG_CRYPTO_RSA=n
 CONFIG_CRYPTO_KEYSIZE=4096
+CONFIG_CRYPTO_AES=y
 CONFIG_VQUANTUM_HYBRID=m
 CONFIG_VQUANTUM_QSIM=m
 CONFIG_KVM_GUEST=y
@@ -238,6 +312,9 @@ CONFIG_LOCALVERSION="-quantum-powerhouse"
 CONFIG_MODULE_COMPRESS_XZ=y
 CONFIG_SECURITY_APPARMOR=y
 CONFIG_DEFAULT_SECURITY_APPARMOR=y
+CONFIG_CRYPTO_KRB5=n
+CONFIG_DRM_AST=n
+CONFIG_MDNS=n
 EOC
 make olddefconfig
 mkdir -p drivers/vquantum
@@ -250,7 +327,6 @@ static char *ssd_path = "/mnt/nvme0n1/hybrid";
 module_param(ssd_path, charp, 0644);
 static int __init vquantum_hybrid_init(void) {
     printk(KERN_INFO "VQuantum Hybrid: 900 GB at %s, %d cores\n", ssd_path, num_online_cpus());
-    // Seed random number generator with quantum data
     if (system("python3 /opt/quantum_task.py > /dev/null") == 0) {
         char buffer[32];
         struct file *f = filp_open("/mnt/nvme0n1/quantum/nonce_list.bin", O_RDONLY, 0);
@@ -288,6 +364,41 @@ echo "obj-m += vquantum_hybrid.o vquantum_qsim.o" > drivers/vquantum/Makefile
 make -j20
 make modules_install
 make install
+# Verify kernel compilation
+if ! ls /boot/vmlinuz-linux-quantum-powerhouse >/dev/null 2>&1; then
+    echo "Error: Kernel compilation failed!"
+    exit 1
+fi
+
+# Blacklist Unwanted Modules
+echo "Blacklisting unwanted modules..."
+cat <<EOC > /etc/modprobe.d/blacklist.conf
+blacklist krb5
+blacklist ast
+blacklist avahi
+blacklist mdns
+blacklist iwlwifi
+blacklist bluetooth
+install krb5 /bin/false
+install ast /bin/false
+install avahi /bin/false
+install mdns /bin/false
+install iwlwifi /bin/false
+install bluetooth /bin/false
+EOC
+# Unload any already loaded unwanted modules
+for module in krb5 ast avahi mdns iwlwifi bluetooth; do
+    if lsmod | grep -q "$module"; then
+        rmmod "$module" || true
+    fi
+done
+
+# Rebuild initramfs
+mkinitcpio -P
+if ! ls /boot/initramfs-linux-quantum-powerhouse.img >/dev/null 2>&1; then
+    echo "Error: Failed to rebuild initramfs!"
+    exit 1
+fi
 
 # YubiKey Integration
 ykman piv certificates export 9a /root/yubikey-cert.pem
@@ -306,8 +417,15 @@ PasswordAuthentication no
 ChallengeResponseAuthentication no
 EOC
 systemctl enable sshd
+if ! systemctl is-enabled sshd >/dev/null 2>&1; then
+    echo "Error: Failed to enable sshd!"
+    exit 1
+fi
 
 # Post-Quantum Security for SSH
+# Temporarily enable network for downloading dependencies
+ip link set enp3s0 up
+dhcpcd enp3s0
 git clone https://github.com/open-quantum-safe/liboqs.git
 cd liboqs
 mkdir build && cd build
@@ -325,6 +443,9 @@ KexAlgorithms sntrup761x25519-sha512@openssh.com
 HostKeyAlgorithms ssh-kyber-512
 EOC
 systemctl restart sshd
+# Disable network again
+ip link set enp3s0 down
+systemctl stop dhcpcd || true
 
 # GRUB Configuration
 grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
@@ -340,6 +461,10 @@ password_pbkdf2 admin $GRUB_PW_HASH
 EOC
 sed -i 's/--class os/--class os --unrestricted/' /etc/grub.d/10_linux
 grub-mkconfig -o /boot/grub/grub.cfg
+if ! grep -q "cryptdevice" /boot/grub/grub.cfg; then
+    echo "Error: GRUB configuration failed!"
+    exit 1
+fi
 
 # Security Hardening
 systemctl mask bluetooth.service
@@ -355,7 +480,7 @@ allow id 1050:0407
 block
 EOC
 systemctl enable usbguard
-pacman -R --noconfirm ca-certificates-utils
+pacman -R --noconfirm ca-certificates-utils avahi
 pacman -S --noconfirm nvidia nvidia-utils
 echo "performance" > /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 pacman -S --noconfirm sbctl
@@ -364,34 +489,11 @@ sbctl enroll-keys -m
 sbctl sign -s /boot/EFI/GRUB/grubx64.efi
 systemctl enable apparmor
 
-# Quantum and Storj Setup
-mkdir -p /mnt/nvme0n1/hybrid /mnt/nvme0n1/quantum /mnt/sdb/storj_data /mnt/sdb/storj_identity
+# Quantum Setup
+mkdir -p /mnt/nvme0n1/hybrid /mnt/nvme0n1/quantum
 echo "/dev/vgroot/root /mnt/nvme0n1/hybrid btrfs subvol=@,compress=zstd,ssd,noatime 0 0" >> /etc/fstab
 echo "/dev/vgroot/root /mnt/nvme0n1/quantum btrfs subvol=@,compress=zstd,ssd,noatime 0 0" >> /etc/fstab
-echo "/dev/vgstorj/storj /mnt/sdb/storj_data btrfs subvol=@,compress=zstd,ssd,noatime 0 0" >> /etc/fstab
-echo "/dev/vgstorj/storj /mnt/sdb/storj_identity btrfs subvol=@,compress=zstd,ssd,noatime 0 0" >> /etc/fstab
 mount -a
-
-# VM Setup for Kaspa
-mkdir -p "$VM_DIR"
-curl -L "$ISO_URL" -o "$VM_DIR/ubuntu.iso"
-for i in $(seq 1 $VM_COUNT); do
-    qemu-img create -f qcow2 "$VM_DIR/vm$i.qcow2" 10G
-    virt-install \
-        --name "vm$i" \
-        --ram 2048 \
-        --vcpus 2 \
-        --disk "$VM_DIR/vm$i.qcow2" \
-        --cdrom "$VM_DIR/ubuntu.iso" \
-        --os-variant ubuntu24.04 \
-        --network network=default \
-        --virt-type kvm \
-        --noautoconsole \
-        --import \
-        --autostart \
-        --cpu host-passthrough \
-        --features vmx=on
-done
 
 # Hybrid Buffer (Enhanced for System-Wide Use)
 cat <<EOC > /opt/vquantum_hybrid.rs
@@ -408,7 +510,6 @@ fn process_block(block_id: usize) {
     let chunk = data.chunks(data.len() / BLOCKS).nth(block_id % BLOCKS).unwrap();
     let path = format!("{}/block_{}.bin", SSD_HYBRID, block_id);
     File::create(&path).unwrap().write_all(chunk).unwrap();
-    // Feed quantum data into system entropy pool
     Command::new("rngd").arg("-r").arg(&path).arg("-o").arg("/dev/random").status().unwrap();
     remove_file(&path).unwrap();
 }
@@ -420,6 +521,10 @@ fn main() {
 EOC
 rustc -O /opt/vquantum_hybrid.rs -o /opt/vquantum_hybrid
 chmod +x /opt/vquantum_hybrid
+if ! [ -x /opt/vquantum_hybrid ]; then
+    echo "Error: Failed to compile vquantum_hybrid!"
+    exit 1
+fi
 
 # Quantum Simulator (Enhanced for System-Wide Use)
 cat <<EOC > /opt/vquantum_qsim.py
@@ -439,60 +544,16 @@ sim = qsimcirq.QSimSimulator()
 while True:
     result = sim.simulate(circuit)
     states = result.final_state_vector[:10**6]
-    insight = ollama.chat(model="llama3", messages=[{"role": "user", "content": "Rank states for Kaspa and system tasks"}])
+    insight = ollama.chat(model="llama3", messages=[{"role": "user", "content": "Rank states for system tasks"}])
     ranked_states = sorted(states, key=lambda x: abs(x))[-10**5:]
     np.save(f"{SSD_QUANTUM}/nonce_list.bin", ranked_states)
-    # Feed quantum states into system entropy pool
     os.system(f"rngd -r {SSD_QUANTUM}/nonce_list.bin -o /dev/random")
 EOC
 chmod +x /opt/vquantum_qsim.py
-
-# VM Mining Script
-cat <<EOC > /opt/vm_miner.sh
-#!/bin/bash
-apt update
-apt install -y mesa-vulkan-drivers
-wget https://github.com/KaspMiner/kaspa-miner/releases/latest/download/kaspa-miner -O /opt/kaspa-miner
-chmod +x /opt/kaspa-miner
-/opt/kaspa-miner --pool kaspapool.org:4444 --wallet kaspa:YOUR_KASPA_WALLET --opencl &
-EOC
-chmod +x /opt/vm_miner.sh
-for i in $(seq 1 $VM_COUNT); do
-    virsh -c qemu:///system console "vm$i" < /opt/vm_miner.sh &
-done
-
-# Storj Node Setup
-STATIC_IP=$(ip -4 addr show $ETHERNET | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
-mkdir -p /mnt/sdb/storj_data /mnt/sdb/storj_identity
-docker run -d --rm -it \
-    -e "EMAIL=$STORJ_EMAIL" \
-    -e "ADDRESS=$STATIC_IP:28967" \
-    -e "WALLET=" \
-    -e "STORAGE=900GB" \
-    --mount type=bind,source="/mnt/sdb/storj_identity",destination=/app/identity \
-    --mount type=bind,source="/mnt/sdb/storj_data",destination=/app/config \
-    storjlabs/storjnode:identity
-sleep 10
-IDENTITY_CONTAINER=$(docker ps -q --filter ancestor=storjlabs/storjnode:identity)
-docker exec "$IDENTITY_CONTAINER" storjnode identity create /app/identity
-docker stop "$IDENTITY_CONTAINER"
-docker run -d --rm -it \
-    -e "EMAIL=$STORJ_EMAIL" \
-    --mount type=bind,source="/mnt/sdb/storj_identity",destination=/app/identity \
-    storjlabs/storjnode:identity authorize "$STORJ_EMAIL"
-docker run -d --restart unless-stopped \
-    --name storj_node \
-    -p 28967:28967 \
-    -p 14002:14002 \
-    -e "WALLET=YOUR_ETHEREUM_WALLET" \
-    -e "EMAIL=$STORJ_EMAIL" \
-    -e "ADDRESS=$STATIC_IP:28967" \
-    -e "STORAGE=900GB" \
-    --mount type=bind,source="/mnt/sdb/storj_identity",destination=/app/identity \
-    --mount type=bind,source="/mnt/sdb/storj_data",destination=/app/config \
-    storjlabs/storjnode
-ufw allow 28967
-ufw allow 14002
+if ! [ -x /opt/vquantum_qsim.py ]; then
+    echo "Error: Failed to set up vquantum_qsim!"
+    exit 1
+fi
 
 # System-Wide Quantum Enhancement
 cat <<EOC > /etc/profile.d/quantum_boost.sh
@@ -500,7 +561,6 @@ cat <<EOC > /etc/profile.d/quantum_boost.sh
 export QUANTUM_HYBRID_PATH="/mnt/nvme0n1/hybrid"
 export QUANTUM_QSIM_PATH="/mnt/nvme0n1/quantum"
 alias compute_boost="python3 /opt/quantum_task.py"
-# Preload quantum library for all processes
 export LD_PRELOAD="/usr/local/lib/libquantum_boost.so"
 EOC
 chmod +x /etc/profile.d/quantum_boost.sh
@@ -532,10 +592,13 @@ if __name__ == "__main__":
     hybrid_result = hybrid_task()
     quantum_result = quantum_task()
     print(f"Hybrid Boost: {hybrid_result}, Quantum Boost: {quantum_result}")
-    # Optimize system scheduling with quantum data
     os.system("sysctl -w kernel.sched_quantum_boost=$(echo $quantum_result | cut -d. -f1)")
 EOC
 chmod +x /opt/quantum_task.py
+if ! [ -x /opt/quantum_task.py ]; then
+    echo "Error: Failed to set up quantum_task!"
+    exit 1
+fi
 
 # Quantum Boost Library (for LD_PRELOAD)
 cat <<EOC > /root/quantum_boost.c
@@ -548,6 +611,10 @@ void __attribute__((constructor)) quantum_boost_init(void) {
 }
 EOC
 gcc -shared -fPIC /root/quantum_boost.c -o /usr/local/lib/libquantum_boost.so
+if ! [ -f /usr/local/lib/libquantum_boost.so ]; then
+    echo "Error: Failed to compile quantum_boost library!"
+    exit 1
+fi
 
 # Services
 cat <<EOC > /etc/systemd/system/vquantum_hybrid.service
@@ -572,6 +639,15 @@ WantedBy=multi-user.target
 EOC
 systemctl daemon-reload
 systemctl enable vquantum_hybrid vquantum_qsim NetworkManager
+if ! systemctl is-enabled vquantum_hybrid >/dev/null 2>&1; then
+    echo "Error: Failed to enable vquantum_hybrid service!"
+    exit 1
+fi
+
+# Harden Against Unauthorized Module Loading
+echo "Hardening against unauthorized module loading..."
+echo "kernel.modules_disabled=1" >> /etc/sysctl.conf
+sysctl -p
 
 # Finalize
 exit
