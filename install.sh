@@ -9,6 +9,7 @@ SSD_QUANTUM="/mnt/nvme0n1/quantum"
 WORK_DIR="/root/quantum_powerhouse"
 LOG_FILE="/root/install-log.txt"
 NETWORK_INTERFACE="eth0"
+MINIMUM_SPACE_MB=2000  # Minimum required space in MB (2GB)
 
 # Function to log messages
 log_message() {
@@ -59,9 +60,250 @@ check_network_interface() {
     return 0
 }
 
+# Function to ensure network connectivity
+ensure_network_connectivity() {
+    log_message "Ensuring network connectivity..."
+    local max_attempts=5
+    local attempt=1
+
+    # Set a reliable DNS server
+    log_message "Setting DNS server to 8.8.8.8..."
+    echo "nameserver 8.8.8.8" > /etc/resolv.conf
+
+    # Bring up the network interface
+    if ! ip link set "$NETWORK_INTERFACE" up 2>>"$LOG_FILE"; then
+        log_message "ERROR: Failed to bring up $NETWORK_INTERFACE."
+        return 1
+    fi
+
+    # Start dhcpcd to obtain an IP address
+    if ! dhcpcd "$NETWORK_INTERFACE" 2>>"$LOG_FILE"; then
+        log_message "ERROR: dhcpcd failed to obtain an IP address."
+        return 1
+    fi
+
+    # Test connectivity with a ping to Google's DNS
+    while [ $attempt -le $max_attempts ]; do
+        log_message "Testing network connectivity (Attempt $attempt/$max_attempts)..."
+        if ping -c 3 8.8.8.8 >/dev/null 2>&1; then
+            log_message "Network connectivity confirmed."
+            return 0
+        fi
+        log_message "Network connectivity test failed. Retrying in 5 seconds..."
+        sleep 5
+        attempt=$((attempt + 1))
+    done
+
+    log_message "ERROR: Failed to establish network connectivity after $max_attempts attempts."
+    return 1
+}
+
+# Function to optimize mirrorlist
+optimize_mirrorlist() {
+    log_message "Optimizing mirrorlist..."
+    # Check if reflector is available in the live environment
+    if command -v reflector >/dev/null 2>&1; then
+        log_message "Using reflector to select the fastest mirrors..."
+        if ! reflector --country US,DE,UK --latest 10 --sort rate --save /etc/pacman.d/mirrorlist 2>>"$LOG_FILE"; then
+            log_message "WARNING: Failed to run reflector. Falling back to manual mirrorlist."
+        fi
+    else
+        log_message "Reflector not available. Setting manual mirrorlist..."
+        cat <<EOC > /etc/pacman.d/mirrorlist
+Server = https://mirror.rackspace.com/archlinux/\$repo/os/\$arch
+Server = https://mirrors.kernel.org/archlinux/\$repo/os/\$arch
+Server = https://mirrors.edge.kernel.org/archlinux/\$repo/os/\$arch
+EOC
+    fi
+
+    # Refresh pacman package database
+    log_message "Refreshing pacman package database..."
+    if ! pacman -Syy 2>>"$LOG_FILE"; then
+        handle_error "Refreshing pacman database" "pacman -Syy failed" "pacman -Syy"
+    fi
+}
+
+# Function to check available disk space
+check_disk_space() {
+    log_message "Checking available disk space..."
+    local available_space
+    available_space=$(df -m / | tail -1 | awk '{print $4}')  # Available space in MB
+
+    log_message "Available disk space: $available_space MB"
+    if [ "$available_space" -lt "$MINIMUM_SPACE_MB" ]; then
+        log_message "ERROR: Insufficient disk space. Required: $MINIMUM_SPACE_MB MB, Available: $available_space MB."
+        return 1
+    fi
+    log_message "Sufficient disk space available."
+    return 0
+}
+
+# Function to clean up disk space
+clean_disk_space() {
+    log_message "Cleaning up disk space..."
+    # Remove temporary files
+    rm -rf /tmp/* /var/tmp/* 2>>"$LOG_FILE" || log_message "WARNING: Failed to clean temporary files. Continuing..."
+
+    # Clean pacman cache
+    if [ -d "/var/cache/pacman/pkg" ]; then
+        log_message "Cleaning pacman cache..."
+        rm -rf /var/cache/pacman/pkg/* 2>>"$LOG_FILE" || log_message "WARNING: Failed to clean pacman cache. Continuing..."
+    fi
+
+    # Remove logs
+    if [ -d "/var/log" ]; then
+        log_message "Cleaning logs..."
+        find /var/log -type f -delete 2>>"$LOG_FILE" || log_message "WARNING: Failed to clean logs. Continuing..."
+    fi
+
+    # Check space again
+    local available_space
+    available_space=$(df -m / | tail -1 | awk '{print $4}')
+    log_message "Available disk space after cleanup: $available_space MB"
+    if [ "$available_space" -lt "$MINIMUM_SPACE_MB" ]; then
+        log_message "ERROR: Still insufficient disk space after cleanup. Required: $MINIMUM_SPACE_MB MB, Available: $available_space MB."
+        return 1
+    fi
+    return 0
+}
+
+# Function to remove non-standard packages
+remove_non_standard_packages() {
+    log_message "Removing non-standard packages..."
+    # List of packages that should be present in a standard Arch Linux live ISO
+    local standard_packages="arch-install-scripts base base-devel bash bzip2 coreutils cryptsetup device-mapper dhcpcd diffutils e2fsprogs file filesystem findutils gawk gcc-libs gettext glibc grep gzip inetutils iproute2 iputils less licenses linux linux-firmware logrotate lvm2 man-db man-pages mdadm nano netctl pacman pciutils procps-ng psmisc sed shadow sysfsutils systemd systemd-sysvcompat tar texinfo usbutils util-linux vi which xz"
+
+    # Get list of installed packages
+    local installed_packages
+    installed_packages=$(pacman -Qe | awk '{print $1}')
+
+    # Explicitly remove qemu and ssh-related packages
+    local unwanted_packages="qemu qemu-base qemu-system-x86 openssh sshd"
+    for pkg in $unwanted_packages; do
+        if pacman -Q "$pkg" >/dev/null 2>&1; then
+            log_message "Removing explicitly unwanted package: $pkg..."
+            if ! pacman -R --noconfirm "$pkg" 2>>"$LOG_FILE"; then
+                log_message "WARNING: Failed to remove $pkg. Continuing..."
+            fi
+        fi
+    done
+
+    # Remove non-standard packages
+    for pkg in $installed_packages; do
+        if ! echo "$standard_packages" | grep -qw "$pkg"; then
+            log_message "Removing non-standard package: $pkg..."
+            if ! pacman -R --noconfirm "$pkg" 2>>"$LOG_FILE"; then
+                log_message "WARNING: Failed to remove $pkg. Continuing..."
+            fi
+        fi
+    done
+
+    # Log remaining packages for verification
+    log_message "Remaining packages after cleanup:"
+    pacman -Qe >> "$LOG_FILE" 2>&1
+}
+
+# Function to remove non-standard users and groups
+remove_non_standard_users_groups() {
+    log_message "Removing non-standard users and groups..."
+    # Standard users and groups in Arch live ISO (typically just root)
+    local standard_users="root"
+    local standard_groups="root bin daemon sys adm disk wheel log"
+
+    # Get list of users
+    local users
+    users=$(cut -d: -f1 /etc/passwd)
+
+    # Remove non-standard users
+    for user in $users; do
+        if ! echo "$standard_users" | grep -qw "$user"; then
+            log_message "Removing non-standard user: $user..."
+            if ! userdel -r "$user" 2>>"$LOG_FILE"; then
+                log_message "WARNING: Failed to remove user $user. Continuing..."
+            fi
+        fi
+    done
+
+    # Get list of groups
+    local groups
+    groups=$(cut -d: -f1 /etc/group)
+
+    # Remove non-standard groups
+    for group in $groups; do
+        if ! echo "$standard_groups" | grep -qw "$group"; then
+            log_message "Removing non-standard group: $group..."
+            if ! groupdel "$group" 2>>"$LOG_FILE"; then
+                log_message "WARNING: Failed to remove group $group. Continuing..."
+            fi
+        fi
+    done
+
+    # Log remaining users and groups for verification
+    log_message "Remaining users after cleanup:"
+    cut -d: -f1 /etc/passwd >> "$LOG_FILE"
+    log_message "Remaining groups after cleanup:"
+    cut -d: -f1 /etc/group >> "$LOG_FILE"
+}
+
+# Function to remove non-standard certificates and login items
+remove_non_standard_certs_login() {
+    log_message "Removing non-standard certificates and login items..."
+    # Remove certificates
+    if [ -d "/etc/ssl/certs" ]; then
+        log_message "Removing certificates in /etc/ssl/certs..."
+        rm -rf /etc/ssl/certs/* 2>>"$LOG_FILE" || log_message "WARNING: Failed to remove certificates in /etc/ssl/certs. Continuing..."
+    fi
+    if [ -d "/etc/ca-certificates" ]; then
+        log_message "Removing certificates in /etc/ca-certificates..."
+        rm -rf /etc/ca-certificates/* 2>>"$LOG_FILE" || log_message "WARNING: Failed to remove certificates in /etc/ca-certificates. Continuing..."
+    fi
+
+    # Remove SSH configurations
+    if [ -d "/etc/ssh" ]; then
+        log_message "Removing SSH configurations in /etc/ssh..."
+        rm -rf /etc/ssh/* 2>>"$LOG_FILE" || log_message "WARNING: Failed to remove SSH configurations. Continuing..."
+    fi
+    if [ -d "/root/.ssh" ]; then
+        log_message "Removing SSH configurations in /root/.ssh..."
+        rm -rf /root/.ssh/* 2>>"$LOG_FILE" || log_message "WARNING: Failed to remove SSH configurations in /root/.ssh. Continuing..."
+    fi
+
+    # Reset PAM configurations to minimal
+    log_message "Resetting PAM configurations..."
+    cat <<EOC > /etc/pam.d/system-auth
+auth       required   pam_unix.so
+account    required   pam_unix.so
+password   required   pam_unix.so
+session    required   pam_unix.so
+EOC
+
+    # Remove any login-related configurations
+    if [ -f "/etc/security/pam_env.conf" ]; then
+        log_message "Clearing /etc/security/pam_env.conf..."
+        > /etc/security/pam_env.conf 2>>"$LOG_FILE" || log_message "WARNING: Failed to clear pam_env.conf. Continuing..."
+    fi
+}
+
 # Initialize log file
 > "$LOG_FILE"
 log_message "Starting installation process..."
+
+# Step 0: Clean Up Live Environment
+log_message "Cleaning up live environment..."
+
+# Check disk space and clean up if necessary
+check_disk_space || {
+    log_message "Attempting to free up disk space..."
+    clean_disk_space || {
+        log_message "ERROR: Unable to free up sufficient disk space. Cannot proceed."
+        exit 1
+    }
+}
+
+# Remove non-standard packages, users, groups, certificates, and login items
+remove_non_standard_packages
+remove_non_standard_users_groups
+remove_non_standard_certs_login
 
 # Step 1: Disable Network Access Initially
 log_message "Disabling network access during initial setup..."
@@ -261,18 +503,18 @@ fi
 
 # Step 6: Install Base System (Minimized)
 log_message "Installing base system with minimal dependencies..."
-check_network_interface || log_message "WARNING: Network check failed. Network-dependent steps may fail."
-ip link set "$NETWORK_INTERFACE" up 2>>"$LOG_FILE" || log_message "WARNING: Failed to bring up $NETWORK_INTERFACE. Continuing..."
-dhcpcd "$NETWORK_INTERFACE" 2>>"$LOG_FILE" || log_message "WARNING: dhcpcd failed. Continuing..."
+check_network_interface || { log_message "ERROR: Network check failed. Cannot proceed."; exit 1; }
+ensure_network_connectivity || { log_message "ERROR: Failed to establish network connectivity. Cannot proceed."; exit 1; }
+optimize_mirrorlist
 
 # Log the packages to be installed
-log_message "Packages to be installed: base linux linux-firmware intel-ucode btrfs-progs lvm2 cryptsetup grub efibootmgr networkmanager vim yubikey-manager yubico-piv-tool openssh pam-u2f base-devel git cmake python-pip libvirt virt-install qemu-full ufw apparmor rng-tools"
+log_message "Packages to be installed: base linux linux-firmware intel-ucode btrfs-progs lvm2 cryptsetup grub efibootmgr networkmanager vim yubikey-manager yubico-piv-tool openssh pam-u2f base-devel git cmake python-pip libvirt virt-install ufw apparmor rng-tools"
 
 # Use --needed to avoid reinstalling, and install packages one by one to control dependencies
-for pkg in base linux linux-firmware intel-ucode btrfs-progs lvm2 cryptsetup grub efibootmgr networkmanager vim yubikey-manager yubico-piv-tool openssh pam-u2f base-devel git cmake python-pip libvirt virt-install qemu-full ufw apparmor rng-tools; do
+for pkg in base linux linux-firmware intel-ucode btrfs-progs lvm2 cryptsetup grub efibootmgr networkmanager vim yubikey-manager yubico-piv-tool openssh pam-u2f base-devel git cmake python-pip libvirt virt-install ufw apparmor rng-tools; do
     log_message "Installing $pkg..."
     # Use --nodeps for specific packages with optional dependencies we don't need
-    if [ "$pkg" = "networkmanager" ] || [ "$pkg" = "qemu-full" ] || [ "$pkg" = "libvirt" ]; then
+    if [ "$pkg" = "networkmanager" ] || [ "$pkg" = "libvirt" ]; then
         if ! pacstrap /mnt "$pkg" --needed --nodeps 2>>"$LOG_FILE"; then
             handle_error "Installing $pkg" "pacstrap failed" "pacstrap /mnt $pkg --needed --nodeps"
         fi
@@ -300,7 +542,7 @@ for pkg in ca-certificates-utils avahi wpa_supplicant bluez bluez-utils; do
 done
 
 # Verify package installation
-for pkg in base linux linux-firmware intel-ucode btrfs-progs lvm2 cryptsetup grub efibootmgr networkmanager vim yubikey-manager yubico-piv-tool openssh pam-u2f base-devel git cmake python-pip libvirt virt-install qemu-full ufw apparmor rng-tools; do
+for pkg in base linux linux-firmware intel-ucode btrfs-progs lvm2 cryptsetup grub efibootmgr networkmanager vim yubikey-manager yubico-piv-tool openssh pam-u2f base-devel git cmake python-pip libvirt virt-install ufw apparmor rng-tools; do
     if ! pacman -Q "$pkg" >/dev/null 2>&1; then
         log_message "WARNING: Package $pkg not installed. Attempting to continue..."
     fi
@@ -374,9 +616,23 @@ cat <<EOC > /etc/mkinitcpio.conf
 MODULES=(btrfs crc32c xhci_pci aic94xx bfa qed qla2xxx wd719x)
 HOOKS=(base udev autodetect keyboard keymap modconf block encrypt lvm2 filesystems fsck)
 EOC
+cat <<EOC > /etc/mkinitcpio.d/linux.preset
+# mkinitcpio preset file for the default linux kernel
+ALL_config="/etc/mkinitcpio.conf"
+ALL_kver="/boot/vmlinuz-linux"
+
+PRESETS=('default' 'fallback')
+
+# Default preset
+default_image="/boot/initramfs-linux.img"
+#default_options=""
+
+# Fallback preset
+fallback_image="/boot/initramfs-linux-fallback.img"
+fallback_options="-S autodetect"
+EOC
 cat <<EOC > /etc/mkinitcpio.d/linux-quantum-powerhouse.preset
 # mkinitcpio preset file for the linux-quantum-powerhouse kernel
-
 ALL_config="/etc/mkinitcpio.conf"
 ALL_kver="/boot/vmlinuz-linux-quantum-powerhouse"
 
@@ -568,7 +824,7 @@ EOC
         log_message "WARNING: Kernel compilation failed. Continuing with default kernel..."
     fi
     if ! ls /boot/vmlinuz-linux-quantum-powerhouse >/dev/null 2>&1; then
-        log_message "WARNING: Kernel not installed. Continuing..."
+        log_message "WARNING: Kernel not installed. Continuing with default kernel..."
     fi
 fi
 
@@ -599,13 +855,17 @@ for module in krb5 ast avahi mdns iwlwifi bluetooth; do
     fi
 done
 
-# Rebuild initramfs
+# Rebuild initramfs for both kernels
 log_message "Rebuilding initramfs..."
 if ! mkinitcpio -P 2>>"$LOG_FILE"; then
     log_message "WARNING: Failed to rebuild initramfs. Continuing..."
 fi
+if ! ls /boot/initramfs-linux.img >/dev/null 2>&1; then
+    log_message "ERROR: Default initramfs not created. Cannot continue."
+    exit 1
+fi
 if ! ls /boot/initramfs-linux-quantum-powerhouse.img >/dev/null 2>&1; then
-    log_message "WARNING: initramfs not created. Continuing..."
+    log_message "WARNING: Custom initramfs not created. Continuing with default kernel..."
 fi
 
 # YubiKey Integration with Quantum Randomness
@@ -813,20 +1073,25 @@ import ollama
 import os
 SSD_HYBRID = "/mnt/nvme0n1/hybrid"
 SSD_QUANTUM = "/mnt/nvme0n1/quantum"
-def hybrid_task():
+def hybrid_task() {
     combined = np.ones(1, dtype=np.complex128)
-    for i in range(20):
+    for i in range(20) {
         block_path = f"{SSD_HYBRID}/block_{i}.bin"
-        if os.path.exists(block_path):
+        if os.path.exists(block_path) {
             block = np.fromfile(block_path, dtype=np.complex128)[:2**10]
             combined = np.kron(combined, block)
+        }
+    }
     return combined
-def quantum_task():
+}
+def quantum_task() {
     state_path = f"{SSD_QUANTUM}/nonce_list.bin"
-    if os.path.exists(state_path):
+    if os.path.exists(state_path) {
         state = np.load(state_path)
         return state.sum()
+    }
     return 0
+}
 if __name__ == "__main__":
     ollama.chat(model="llama3", messages=[{"role": "user", "content": "Optimize system tasks"}])
     hybrid_result = hybrid_task()
