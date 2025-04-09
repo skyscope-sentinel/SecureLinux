@@ -1,18 +1,5 @@
 #!/bin/bash
 
-set -e
-
-# Step 0: Tamper Prevention and Script Integrity Check
-echo "Verifying script integrity..."
-# Pre-compute the SHA256 checksum of this script (excluding this comment block)
-# To generate the checksum, run: grep -v "^#" install-arch-skyscope-secure.sh | sha256sum
-EXPECTED_CHECKSUM="your_precomputed_sha256_checksum_here"
-CURRENT_CHECKSUM=$(grep -v "^#" "$0" | sha256sum | awk '{print $1}')
-if [ "$CURRENT_CHECKSUM" != "$EXPECTED_CHECKSUM" ]; then
-    echo "Error: Script has been modified! Expected SHA256: $EXPECTED_CHECKSUM, Got: $CURRENT_CHECKSUM"
-    exit 1
-fi
-
 # Disable network access to prevent remote interference
 echo "Disabling network access during installation..."
 systemctl stop dhcpcd || true
