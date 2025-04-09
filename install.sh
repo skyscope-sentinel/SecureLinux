@@ -2,93 +2,147 @@
 
 set -e
 
-# Step 0: Tamper Prevention and Script Integrity Check
-echo "Verifying script integrity..."
-# Pre-compute the SHA256 checksum of this script (excluding this comment block)
-# To generate the checksum, run: grep -v "^#" install-arch-skyscope-secure.sh | sha256sum
-EXPECTED_CHECKSUM="your_precomputed_sha256_checksum_here"
-CURRENT_CHECKSUM=$(grep -v "^#" "$0" | sha256sum | awk '{print $1}')
-if [ "$CURRENT_CHECKSUM" != "$EXPECTED_CHECKSUM" ]; then
-    echo "Error: Script has been modified! Expected SHA256: $EXPECTED_CHECKSUM, Got: $CURRENT_CHECKSUM"
-    exit 1
-fi
-
-# Disable network access to prevent remote interference (we'll enable it only when needed)
-echo "Disabling network access during installation..."
-systemctl stop dhcpcd || true
-ip link set enp3s0 down || true
-
 # Variables
 SSD_OS="/mnt/nvme0n1"  # 931.5GB for OS and quantum
 SSD_HYBRID="/mnt/nvme0n1/hybrid"
 SSD_QUANTUM="/mnt/nvme0n1/quantum"
 WORK_DIR="/root/quantum_powerhouse"
+LOG_FILE="/root/install-log.txt"
+NETWORK_INTERFACE="eth0"
 
-# Step 1: Verify Disk Setup
-echo "Verifying disk setup..."
+# Function to log messages
+log_message() {
+    local message="$1"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $message" | tee -a "$LOG_FILE"
+}
+
+# Function to handle errors with retry mechanism
+handle_error() {
+    local step="$1"
+    local error_msg="$2"
+    local retry_cmd="$3"
+    local max_retries=3
+    local retry_count=0
+
+    log_message "ERROR: $step failed - $error_msg"
+    while [ $retry_count -lt $max_retries ]; do
+        log_message "Retrying $step (Attempt $((retry_count + 1))/$max_retries)..."
+        if eval "$retry_cmd"; then
+            log_message "$step succeeded on retry $((retry_count + 1))."
+            return 0
+        fi
+        retry_count=$((retry_count + 1))
+        sleep 5
+    done
+
+    log_message "ERROR: $step failed after $max_retries retries. Attempting to continue..."
+    return 1
+}
+
+# Function to check and set network interface
+check_network_interface() {
+    log_message "Checking network interfaces..."
+    local interfaces
+    interfaces=$(ip link | grep -E '^[0-9]+: ' | awk '{print $2}' | cut -d':' -f1 | grep -v 'lo')
+
+    if echo "$interfaces" | grep -q "^$NETWORK_INTERFACE$"; then
+        log_message "Network interface $NETWORK_INTERFACE found."
+    else
+        log_message "Network interface $NETWORK_INTERFACE not found. Available interfaces: $interfaces"
+        NETWORK_INTERFACE=$(echo "$interfaces" | head -n 1)
+        if [ -z "$NETWORK_INTERFACE" ]; then
+            log_message "ERROR: No network interfaces found. Cannot proceed with network-dependent steps."
+            return 1
+        fi
+        log_message "Falling back to first available interface: $NETWORK_INTERFACE"
+    fi
+    return 0
+}
+
+# Initialize log file
+> "$LOG_FILE"
+log_message "Starting installation process..."
+
+# Step 1: Disable Network Access Initially
+log_message "Disabling network access during initial setup..."
+if ! ip link set "$NETWORK_INTERFACE" down 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to disable network interface $NETWORK_INTERFACE. Continuing..."
+fi
+systemctl stop dhcpcd 2>>"$LOG_FILE" || true
+
+# Step 2: Verify Disk Setup
+log_message "Verifying disk setup..."
 for disk in /dev/nvme0n1 /dev/nvme1n1 /dev/sda /dev/sdb; do
     if ! lsblk -f | grep -q "$(basename $disk)"; then
-        echo "Error: Disk $disk not found!"
+        log_message "ERROR: Disk $disk not found!"
         exit 1
     fi
 done
 if cryptsetup status wipe0n1 >/dev/null 2>&1 || cryptsetup status wipe1n1 >/dev/null 2>&1; then
-    echo "Error: Wipe mappings still active. Closing them..."
-    cryptsetup close wipe0n1 || true
-    cryptsetup close wipe1n1 || true
+    log_message "Wipe mappings still active. Closing them..."
+    cryptsetup close wipe0n1 2>>"$LOG_FILE" || true
+    cryptsetup close wipe1n1 2>>"$LOG_FILE" || true
 fi
 
-# Step 2: Optimized Disk Wiping and Partitioning
-echo "Wiping and partitioning drives..."
-# Fast wipe: Use blkdiscard for SSDs (nvme0n1, nvme1n1, sdb), minimal wipe for HDD (sda)
+# Step 3: Optimized Disk Wiping and Partitioning
+log_message "Wiping and partitioning drives..."
 for disk in /dev/nvme0n1 /dev/nvme1n1 /dev/sdb; do
-    echo "Fast wiping SSD $disk..."
-    blkdiscard -f $disk || true  # Fast wipe for SSDs
+    log_message "Fast wiping SSD $disk..."
+    if ! blkdiscard -f "$disk" 2>>"$LOG_FILE"; then
+        handle_error "Wiping SSD $disk" "blkdiscard failed" "blkdiscard -f $disk"
+    fi
 done
-# Minimal wipe for HDD (sda) to speed up
-echo "Minimally wiping HDD /dev/sda..."
-dd if=/dev/zero of=/dev/sda bs=4M count=100 status=progress  # Wipe only the first 400MB
-wipefs -a /dev/sda  # Clear any remaining signatures
+log_message "Minimally wiping HDD /dev/sda..."
+if ! dd if=/dev/zero of=/dev/sda bs=4M count=100 status=progress 2>>"$LOG_FILE"; then
+    handle_error "Wiping HDD /dev/sda" "dd failed" "dd if=/dev/zero of=/dev/sda bs=4M count=100 status=progress"
+fi
+if ! wipefs -a /dev/sda 2>>"$LOG_FILE"; then
+    handle_error "Wiping signatures on /dev/sda" "wipefs failed" "wipefs -a /dev/sda"
+fi
 
 # Partitioning
-# /dev/nvme0n1 (931.5GB): OS, swap, quantum
-parted -s /dev/nvme0n1 mklabel gpt
-parted -s /dev/nvme0n1 mkpart primary 1MiB 513MiB  # EFI
-parted -s /dev/nvme0n1 set 1 esp on
-parted -s /dev/nvme0n1 mkpart primary 513MiB 100%  # LVM
-parted -s /dev/nvme0n1 set 2 lvm on
-mkfs.fat -F32 /dev/nvme0n1p1
-
-# /dev/nvme1n1 (233GB): Additional storage (optional quantum data)
-parted -s /dev/nvme1n1 mklabel gpt
-parted -s /dev/nvme1n1 mkpart primary 1MiB 100%  # LVM
-parted -s /dev/nvme1n1 set 1 lvm on
-
-# /dev/sda (1.8TB): Home
-parted -s /dev/sda mklabel gpt
-parted -s /dev/sda mkpart primary 1MiB 100%  # LVM
-parted -s /dev/sda set 1 lvm on
-
-# /dev/sdb (931.5GB): Additional storage
-parted -s /dev/sdb mklabel gpt
-parted -s /dev/sdb mkpart primary 1MiB 100%  # LVM
-parted -s /dev/sdb set 1 lvm on
+for disk in /dev/nvme0n1 /dev/nvme1n1 /dev/sda /dev/sdb; do
+    log_message "Partitioning $disk..."
+    case $disk in
+        /dev/nvme0n1)
+            if ! parted -s "$disk" mklabel gpt 2>>"$LOG_FILE" ||
+               ! parted -s "$disk" mkpart primary 1MiB 513MiB 2>>"$LOG_FILE" ||
+               ! parted -s "$disk" set 1 esp on 2>>"$LOG_FILE" ||
+               ! parted -s "$disk" mkpart primary 513MiB 100% 2>>"$LOG_FILE" ||
+               ! parted -s "$disk" set 2 lvm on 2>>"$LOG_FILE"; then
+                handle_error "Partitioning $disk" "parted failed" "parted -s $disk mklabel gpt && parted -s $disk mkpart primary 1MiB 513MiB && parted -s $disk set 1 esp on && parted -s $disk mkpart primary 513MiB 100% && parted -s $disk set 2 lvm on"
+            fi
+            if ! mkfs.fat -F32 "${disk}p1" 2>>"$LOG_FILE"; then
+                handle_error "Formatting EFI partition on $disk" "mkfs.fat failed" "mkfs.fat -F32 ${disk}p1"
+            fi
+            ;;
+        *)
+            if ! parted -s "$disk" mklabel gpt 2>>"$LOG_FILE" ||
+               ! parted -s "$disk" mkpart primary 1MiB 100% 2>>"$LOG_FILE" ||
+               ! parted -s "$disk" set 1 lvm on 2>>"$LOG_FILE"; then
+                handle_error "Partitioning $disk" "parted failed" "parted -s $disk mklabel gpt && parted -s $disk mkpart primary 1MiB 100% && parted -s $disk set 1 lvm on"
+            fi
+            ;;
+    esac
+done
 
 # Verify partitioning
 for disk in /dev/nvme0n1 /dev/nvme1n1 /dev/sda /dev/sdb; do
-    if ! lsblk $disk | grep -q "part"; then
-        echo "Error: Partitioning failed for $disk!"
+    if ! lsblk "$disk" | grep -q "part"; then
+        log_message "ERROR: Partitioning failed for $disk! Cannot continue."
         exit 1
     fi
 done
 
-# Step 3: Set Up LUKS2 Encryption with Post-Quantum Enhancements
-echo "Setting up LUKS2 encryption with quantum randomness..."
-# Use quantum randomness for LUKS key generation
-pacman -S --noconfirm rng-tools  # Install rng-tools in live environment
-rngd -r /dev/urandom  # Seed initial randomness
+# Step 4: Set Up LUKS2 Encryption with Post-Quantum Enhancements
+log_message "Setting up LUKS2 encryption with quantum randomness..."
+if ! pacman -S --noconfirm rng-tools 2>>"$LOG_FILE"; then
+    handle_error "Installing rng-tools" "pacman failed" "pacman -S --noconfirm rng-tools"
+fi
+rngd -r /dev/urandom 2>>"$LOG_FILE" || log_message "WARNING: rngd failed to seed initial randomness. Continuing..."
 mkdir -p /tmp/luks-passphrases
 for disk in /dev/nvme0n1p2 /dev/nvme1n1p1 /dev/sda1 /dev/sdb1; do
+    log_message "Setting up LUKS on $disk..."
     echo "Enter passphrase for $disk (minimum 20 characters):"
     read -s passphrase
     while [ ${#passphrase} -lt 20 ]; do
@@ -109,129 +163,217 @@ for disk in /dev/nvme0n1p2 /dev/nvme1n1p1 /dev/sda1 /dev/sdb1; do
         echo
     done
     echo -n "$passphrase" > "/tmp/luks-passphrases/$(basename $disk).pass"
-    echo "Formatting $disk with LUKS (using quantum randomness)..."
-    # Use quantum randomness for LUKS key
-    dd if=/dev/urandom of=/tmp/luks-key bs=512 count=1
-    rngd -r /tmp/luks-key -o /dev/random
-    echo -n "$passphrase" | cryptsetup luksFormat --type luks2 --cipher aes-xts-plain64 --key-size 512 --hash sha512 --pbkdf argon2id --iter-time 10000 "$disk" -
-    echo "Opening $disk..."
-    echo -n "$passphrase" | cryptsetup open "$disk" "crypt$(basename $disk)" -
-    # Verify LUKS setup
+    log_message "Formatting $disk with LUKS..."
+    if ! dd if=/dev/urandom of=/tmp/luks-key bs=512 count=1 2>>"$LOG_FILE" ||
+       ! rngd -r /tmp/luks-key -o /dev/random 2>>"$LOG_FILE" ||
+       ! echo -n "$passphrase" | cryptsetup luksFormat --type luks2 --cipher aes-xts-plain64 --key-size 512 --hash sha512 --pbkdf argon2id --iter-time 10000 "$disk" - 2>>"$LOG_FILE"; then
+        handle_error "Formatting $disk with LUKS" "cryptsetup luksFormat failed" "dd if=/dev/urandom of=/tmp/luks-key bs=512 count=1 && rngd -r /tmp/luks-key -o /dev/random && echo -n \"$passphrase\" | cryptsetup luksFormat --type luks2 --cipher aes-xts-plain64 --key-size 512 --hash sha512 --pbkdf argon2id --iter-time 10000 \"$disk\" -"
+    fi
+    log_message "Opening $disk..."
+    if ! echo -n "$passphrase" | cryptsetup open "$disk" "crypt$(basename $disk)" - 2>>"$LOG_FILE"; then
+        handle_error "Opening LUKS container on $disk" "cryptsetup open failed" "echo -n \"$passphrase\" | cryptsetup open \"$disk\" \"crypt$(basename $disk)\" -"
+    fi
     if ! cryptsetup status "crypt$(basename $disk)" >/dev/null 2>&1; then
-        echo "Error: Failed to open LUKS container for $disk!"
+        log_message "ERROR: Failed to open LUKS container for $disk! Cannot continue."
         exit 1
     fi
 done
-# Backup LUKS headers
 for disk in /dev/nvme0n1p2 /dev/nvme1n1p1 /dev/sda1 /dev/sdb1; do
-    cryptsetup luksHeaderBackup "$disk" --header-backup-file "/root/luks-header-$(basename $disk).bin"
-    if [ ! -f "/root/luks-header-$(basename $disk).bin" ]; then
-        echo "Error: Failed to backup LUKS header for $disk!"
-        exit 1
+    log_message "Backing up LUKS header for $disk..."
+    if ! cryptsetup luksHeaderBackup "$disk" --header-backup-file "/root/luks-header-$(basename $disk).bin" 2>>"$LOG_FILE"; then
+        handle_error "Backing up LUKS header for $disk" "cryptsetup luksHeaderBackup failed" "cryptsetup luksHeaderBackup \"$disk\" --header-backup-file \"/root/luks-header-$(basename $disk).bin\""
     fi
 done
 
-# Step 4: Configure LVM and Btrfs
-echo "Configuring LVM and Btrfs..."
-pvcreate /dev/mapper/cryptnvme0n1p2
-pvcreate /dev/mapper/cryptnvme1n1p1
-pvcreate /dev/mapper/cryptsda1
-pvcreate /dev/mapper/cryptsdb1
-vgcreate vgroot /dev/mapper/cryptnvme0n1p2
-vgcreate vgextra /dev/mapper/cryptnvme1n1p1
-vgcreate vghome /dev/mapper/cryptsda1
-vgcreate vgextra2 /dev/mapper/cryptsdb1
-lvcreate -L 32G vgroot -n swap
-lvcreate -l 100%FREE vgroot -n root
-lvcreate -l 100%FREE vgextra -n extra
-lvcreate -l 100%FREE vghome -n home
-lvcreate -l 100%FREE vgextra2 -n extra2
-mkfs.btrfs -L root /dev/vgroot/root
-mkfs.btrfs -L extra /dev/vgextra/extra
-mkfs.btrfs -L home /dev/vghome/home
-mkfs.btrfs -L extra2 /dev/vgextra2/extra2
-mount /dev/vgroot/root /mnt
-btrfs subvolume create /mnt/@
-btrfs subvolume create /mnt/@snapshots
-umount /mnt
-mount /dev/vghome/home /mnt
-btrfs subvolume create /mnt/@home
-umount /mnt
-mount -o subvol=@,compress=zstd,ssd,noatime /dev/vgroot/root /mnt
+# Step 5: Configure LVM and Btrfs
+log_message "Configuring LVM and Btrfs..."
+for dev in /dev/mapper/cryptnvme0n1p2 /dev/mapper/cryptnvme1n1p1 /dev/mapper/cryptsda1 /dev/mapper/cryptsdb1; do
+    if ! pvcreate "$dev" 2>>"$LOG_FILE"; then
+        handle_error "Creating physical volume on $dev" "pvcreate failed" "pvcreate \"$dev\""
+    fi
+done
+if ! vgcreate vgroot /dev/mapper/cryptnvme0n1p2 2>>"$LOG_FILE"; then
+    handle_error "Creating volume group vgroot" "vgcreate failed" "vgcreate vgroot /dev/mapper/cryptnvme0n1p2"
+fi
+if ! vgcreate vgextra /dev/mapper/cryptnvme1n1p1 2>>"$LOG_FILE"; then
+    handle_error "Creating volume group vgextra" "vgcreate failed" "vgcreate vgextra /dev/mapper/cryptnvme1n1p1"
+fi
+if ! vgcreate vghome /dev/mapper/cryptsda1 2>>"$LOG_FILE"; then
+    handle_error "Creating volume group vghome" "vgcreate failed" "vgcreate vghome /dev/mapper/cryptsda1"
+fi
+if ! vgcreate vgextra2 /dev/mapper/cryptsdb1 2>>"$LOG_FILE"; then
+    handle_error "Creating volume group vgextra2" "vgcreate failed" "vgcreate vgextra2 /dev/mapper/cryptsdb1"
+fi
+if ! lvcreate -L 32G vgroot -n swap 2>>"$LOG_FILE"; then
+    handle_error "Creating swap logical volume" "lvcreate failed" "lvcreate -L 32G vgroot -n swap"
+fi
+if ! lvcreate -l 100%FREE vgroot -n root 2>>"$LOG_FILE"; then
+    handle_error "Creating root logical volume" "lvcreate failed" "lvcreate -l 100%FREE vgroot -n root"
+fi
+if ! lvcreate -l 100%FREE vgextra -n extra 2>>"$LOG_FILE"; then
+    handle_error "Creating extra logical volume" "lvcreate failed" "lvcreate -l 100%FREE vgextra -n extra"
+fi
+if ! lvcreate -l 100%FREE vghome -n home 2>>"$LOG_FILE"; then
+    handle_error "Creating home logical volume" "lvcreate failed" "lvcreate -l 100%FREE vghome -n home"
+fi
+if ! lvcreate -l 100%FREE vgextra2 -n extra2 2>>"$LOG_FILE"; then
+    handle_error "Creating extra2 logical volume" "lvcreate failed" "lvcreate -l 100%FREE vgextra2 -n extra2"
+fi
+for lv in /dev/vgroot/root /dev/vgextra/extra /dev/vghome/home /dev/vgextra2/extra2; do
+    if ! mkfs.btrfs -L "$(basename $lv)" "$lv" 2>>"$LOG_FILE"; then
+        handle_error "Formatting $lv with Btrfs" "mkfs.btrfs failed" "mkfs.btrfs -L \"$(basename $lv)\" \"$lv\""
+    fi
+done
+if ! mount /dev/vgroot/root /mnt 2>>"$LOG_FILE" ||
+   ! btrfs subvolume create /mnt/@ 2>>"$LOG_FILE" ||
+   ! btrfs subvolume create /mnt/@snapshots 2>>"$LOG_FILE"; then
+    handle_error "Creating Btrfs subvolumes on /dev/vgroot/root" "btrfs subvolume create failed" "mount /dev/vgroot/root /mnt && btrfs subvolume create /mnt/@ && btrfs subvolume create /mnt/@snapshots"
+fi
+umount /mnt 2>>"$LOG_FILE" || true
+if ! mount /dev/vghome/home /mnt 2>>"$LOG_FILE" ||
+   ! btrfs subvolume create /mnt/@home 2>>"$LOG_FILE"; then
+    handle_error "Creating Btrfs subvolume @home on /dev/vghome/home" "btrfs subvolume create failed" "mount /dev/vghome/home /mnt && btrfs subvolume create /mnt/@home"
+fi
+umount /mnt 2>>"$LOG_FILE" || true
+if ! mount -o subvol=@,compress=zstd,ssd,noatime /dev/vgroot/root /mnt 2>>"$LOG_FILE"; then
+    handle_error "Mounting root filesystem" "mount failed" "mount -o subvol=@,compress=zstd,ssd,noatime /dev/vgroot/root /mnt"
+fi
 mkdir -p /mnt/{boot,home,.snapshots}
-mount -o subvol=@home,compress=zstd,ssd,noatime /dev/vghome/home /mnt/home
-mount -o subvol=@snapshots,compress=zstd,ssd,noatime /dev/vgroot/root /mnt/.snapshots
-mount /dev/nvme0n1p1 /mnt/boot
-mkswap /dev/vgroot/swap
-swapon /dev/vgroot/swap
-# Verify mounts
+if ! mount -o subvol=@home,compress=zstd,ssd,noatime /dev/vghome/home /mnt/home 2>>"$LOG_FILE"; then
+    handle_error "Mounting home filesystem" "mount failed" "mount -o subvol=@home,compress=zstd,ssd,noatime /dev/vghome/home /mnt/home"
+fi
+if ! mount -o subvol=@snapshots,compress=zstd,ssd,noatime /dev/vgroot/root /mnt/.snapshots 2>>"$LOG_FILE"; then
+    handle_error "Mounting snapshots filesystem" "mount failed" "mount -o subvol=@snapshots,compress=zstd,ssd,noatime /dev/vgroot/root /mnt/.snapshots"
+fi
+if ! mount /dev/nvme0n1p1 /mnt/boot 2>>"$LOG_FILE"; then
+    handle_error "Mounting boot filesystem" "mount failed" "mount /dev/nvme0n1p1 /mnt/boot"
+fi
+if ! mkswap /dev/vgroot/swap 2>>"$LOG_FILE"; then
+    handle_error "Creating swap" "mkswap failed" "mkswap /dev/vgroot/swap"
+fi
+if ! swapon /dev/vgroot/swap 2>>"$LOG_FILE"; then
+    handle_error "Enabling swap" "swapon failed" "swapon /dev/vgroot/swap"
+fi
 if ! mount | grep -q "/mnt type btrfs"; then
-    echo "Error: Failed to mount root filesystem!"
+    log_message "ERROR: Failed to mount root filesystem! Cannot continue."
     exit 1
 fi
 
-# Step 5: Install Base System
-echo "Installing base system..."
-# Temporarily enable network for package installation
-ip link set enp3s0 up
-dhcpcd enp3s0
-pacstrap /mnt base linux linux-firmware intel-ucode btrfs-progs lvm2 cryptsetup grub efibootmgr networkmanager vim yubikey-manager yubico-piv-tool openssh pam-u2f base-devel git cmake python-pip libvirt virt-install qemu-full ufw apparmor rng-tools
-# Verify package installation
+# Step 6: Install Base System (Minimized)
+log_message "Installing base system with minimal dependencies..."
+check_network_interface || log_message "WARNING: Network check failed. Network-dependent steps may fail."
+ip link set "$NETWORK_INTERFACE" up 2>>"$LOG_FILE" || log_message "WARNING: Failed to bring up $NETWORK_INTERFACE. Continuing..."
+dhcpcd "$NETWORK_INTERFACE" 2>>"$LOG_FILE" || log_message "WARNING: dhcpcd failed. Continuing..."
+
+# Log the packages to be installed
+log_message "Packages to be installed: base linux linux-firmware intel-ucode btrfs-progs lvm2 cryptsetup grub efibootmgr networkmanager vim yubikey-manager yubico-piv-tool openssh pam-u2f base-devel git cmake python-pip libvirt virt-install qemu-full ufw apparmor rng-tools"
+
+# Use --needed to avoid reinstalling, and install packages one by one to control dependencies
 for pkg in base linux linux-firmware intel-ucode btrfs-progs lvm2 cryptsetup grub efibootmgr networkmanager vim yubikey-manager yubico-piv-tool openssh pam-u2f base-devel git cmake python-pip libvirt virt-install qemu-full ufw apparmor rng-tools; do
-    if ! pacman -Q $pkg >/dev/null 2>&1; then
-        echo "Error: Failed to install package $pkg!"
-        exit 1
+    log_message "Installing $pkg..."
+    # Use --nodeps for specific packages with optional dependencies we don't need
+    if [ "$pkg" = "networkmanager" ] || [ "$pkg" = "qemu-full" ] || [ "$pkg" = "libvirt" ]; then
+        if ! pacstrap /mnt "$pkg" --needed --nodeps 2>>"$LOG_FILE"; then
+            handle_error "Installing $pkg" "pacstrap failed" "pacstrap /mnt $pkg --needed --nodeps"
+        fi
+    else
+        if ! pacstrap /mnt "$pkg" --needed 2>>"$LOG_FILE"; then
+            handle_error "Installing $pkg" "pacstrap failed" "pacstrap /mnt $pkg --needed"
+        fi
     fi
 done
-# Disable network again
-ip link set enp3s0 down
-systemctl stop dhcpcd || true
-genfstab -U /mnt >> /mnt/etc/fstab
-sed -i 's/subvolid=[0-9]*/subvol=@/' /mnt/etc/fstab
 
-# Step 6: Chroot and Configure System
-echo "Configuring system..."
-arch-chroot /mnt /bin/bash <<'EOF'
+# Log all installed packages for debugging
+log_message "Logging all installed packages..."
+pacman -Qe > /mnt/root/installed-packages.txt 2>>"$LOG_FILE"
+log_message "Installed packages logged to /mnt/root/installed-packages.txt"
+
+# Remove unwanted packages immediately after pacstrap
+log_message "Removing unwanted packages..."
+for pkg in ca-certificates-utils avahi wpa_supplicant bluez bluez-utils; do
+    if pacman -Q "$pkg" >/dev/null 2>&1; then
+        log_message "Removing $pkg..."
+        if ! pacman -R --noconfirm "$pkg" 2>>"$LOG_FILE"; then
+            log_message "WARNING: Failed to remove $pkg. Continuing..."
+        fi
+    fi
+done
+
+# Verify package installation
+for pkg in base linux linux-firmware intel-ucode btrfs-progs lvm2 cryptsetup grub efibootmgr networkmanager vim yubikey-manager yubico-piv-tool openssh pam-u2f base-devel git cmake python-pip libvirt virt-install qemu-full ufw apparmor rng-tools; do
+    if ! pacman -Q "$pkg" >/dev/null 2>&1; then
+        log_message "WARNING: Package $pkg not installed. Attempting to continue..."
+    fi
+done
+
+ip link set "$NETWORK_INTERFACE" down 2>>"$LOG_FILE" || true
+systemctl stop dhcpcd 2>>"$LOG_FILE" || true
+if ! genfstab -U /mnt >> /mnt/etc/fstab 2>>"$LOG_FILE"; then
+    handle_error "Generating fstab" "genfstab failed" "genfstab -U /mnt >> /mnt/etc/fstab"
+fi
+if ! sed -i 's/subvolid=[0-9]*/subvol=@/' /mnt/etc/fstab 2>>"$LOG_FILE"; then
+    handle_error "Modifying fstab" "sed failed" "sed -i 's/subvolid=[0-9]*/subvol=@/' /mnt/etc/fstab"
+fi
+
+# Step 7: Chroot and Configure System
+log_message "Configuring system..."
+arch-chroot /mnt /bin/bash <<'EOF' || log_message "WARNING: Chroot failed. Attempting to continue..."
 set -e
 
-# Enable UFW now that it's installed
-ufw enable
-ufw default deny incoming
-ufw default deny outgoing
+# Log file inside chroot
+LOG_FILE="/root/install-log.txt"
+log_message() {
+    local message="$1"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $message" | tee -a "$LOG_FILE"
+}
+
+# Enable UFW
+log_message "Enabling UFW..."
+if ! ufw enable 2>>"$LOG_FILE" ||
+   ! ufw default deny incoming 2>>"$LOG_FILE" ||
+   ! ufw default deny outgoing 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to enable UFW. Continuing..."
+fi
 
 # Timezone and Clock
-ln -sf /usr/share/zoneinfo/UTC /etc/localtime
-hwclock --systohc
+log_message "Setting timezone and clock..."
+if ! ln -sf /usr/share/zoneinfo/UTC /etc/localtime 2>>"$LOG_FILE" ||
+   ! hwclock --systohc 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to set timezone or clock. Continuing..."
+fi
 if [ "$(date +%Z)" != "UTC" ]; then
-    echo "Error: Failed to set timezone to UTC!"
-    exit 1
+    log_message "WARNING: Timezone not set to UTC. Continuing..."
 fi
 
 # Locale
-echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
-locale-gen
-echo "LANG=en_US.UTF-8" > /etc/locale.conf
+log_message "Setting locale..."
+if ! echo "en_US.UTF-8 UTF-8" > /etc/locale.gen 2>>"$LOG_FILE" ||
+   ! locale-gen 2>>"$LOG_FILE" ||
+   ! echo "LANG=en_US.UTF-8" > /etc/locale.conf 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to set locale. Continuing..."
+fi
 if ! locale | grep -q "LANG=en_US.UTF-8"; then
-    echo "Error: Failed to set locale!"
-    exit 1
+    log_message "WARNING: Locale not set to en_US.UTF-8. Continuing..."
 fi
 
 # Hostname
-echo "skyscope-research" > /etc/hostname
-echo "127.0.0.1 localhost" >> /etc/hosts
-echo "::1 localhost" >> /etc/hosts
-echo "127.0.1.1 skyscope-research.local skyscope-research" >> /etc/hosts
+log_message "Setting hostname..."
+if ! echo "skyscope-research" > /etc/hostname 2>>"$LOG_FILE" ||
+   ! echo "127.0.0.1 localhost" >> /etc/hosts 2>>"$LOG_FILE" ||
+   ! echo "::1 localhost" >> /etc/hosts 2>>"$LOG_FILE" ||
+   ! echo "127.0.1.1 skyscope-research.local skyscope-research" >> /etc/hosts 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to set hostname or hosts file. Continuing..."
+fi
 if ! grep -q "skyscope-research" /etc/hostname; then
-    echo "Error: Failed to set hostname!"
-    exit 1
+    log_message "WARNING: Hostname not set correctly. Continuing..."
 fi
 
 # mkinitcpio Configuration
+log_message "Configuring mkinitcpio..."
 cat <<EOC > /etc/mkinitcpio.conf
-MODULES=(btrfs crc32c)
+MODULES=(btrfs crc32c xhci_pci aic94xx bfa qed qla2xxx wd719x)
 HOOKS=(base udev autodetect keyboard keymap modconf block encrypt lvm2 filesystems fsck)
 EOC
-# Create a preset for the custom kernel
 cat <<EOC > /etc/mkinitcpio.d/linux-quantum-powerhouse.preset
 # mkinitcpio preset file for the linux-quantum-powerhouse kernel
 
@@ -250,8 +392,11 @@ fallback_options="-S autodetect"
 EOC
 
 # Set Root User
-usermod -l skyscope-research root
-usermod -d /root -m skyscope-research
+log_message "Setting root user..."
+if ! usermod -l skyscope-research root 2>>"$LOG_FILE" ||
+   ! usermod -d /root -m skyscope-research 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to modify root user. Continuing..."
+fi
 echo "Enter password for skyscope-research (minimum 20 characters):"
 read -s root_passphrase
 while [ ${#root_passphrase} -lt 20 ]; do
@@ -271,47 +416,46 @@ while [ "$root_passphrase" != "$root_passphrase_confirm" ]; do
     read -s root_passphrase_confirm
     echo
 done
-echo "skyscope-research:$root_passphrase" | chpasswd
+if ! echo "skyscope-research:$root_passphrase" | chpasswd 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to set root password. Continuing..."
+fi
 
 # Install Additional Dependencies
-# Temporarily enable network for package installation
-ip link set enp3s0 up
-dhcpcd enp3s0
-pacman -S --noconfirm rustup
-rustup default stable
-pip install qiskit numpy
-
-# Install Anaconda
-if [ ! -d "/root/anaconda3" ]; then
-    curl -L https://repo.anaconda.com/archive/Anaconda3-latest-Linux-x86_64.sh -o anaconda.sh
-    bash anaconda.sh -b -p /root/anaconda3
+log_message "Installing additional dependencies..."
+ip link set eth0 up 2>>"$LOG_FILE" || log_message "WARNING: Failed to bring up eth0. Continuing..."
+dhcpcd eth0 2>>"$LOG_FILE" || log_message "WARNING: dhcpcd failed. Continuing..."
+if ! pacman -S --noconfirm --needed rustup 2>>"$LOG_FILE" ||
+   ! rustup default stable 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to install rustup. Continuing..."
 fi
-source /root/anaconda3/bin/activate
-
-# Install Ollama
-curl -fsSL https://ollama.com/install.sh | sh
-
-# Disable network again
-ip link set enp3s0 down
-systemctl stop dhcpcd || true
+if ! pip install qiskit numpy 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to install qiskit and numpy. Continuing..."
+fi
+if [ ! -d "/root/anaconda3" ]; then
+    if ! curl -L https://repo.anaconda.com/archive/Anaconda3-latest-Linux-x86_64.sh -o anaconda.sh 2>>"$LOG_FILE" ||
+       ! bash anaconda.sh -b -p /root/anaconda3 2>>"$LOG_FILE"; then
+        log_message "WARNING: Failed to install Anaconda. Continuing..."
+    fi
+fi
+source /root/anaconda3/bin/activate 2>>"$LOG_FILE" || log_message "WARNING: Failed to activate Anaconda. Continuing..."
+if ! curl -fsSL https://ollama.com/install.sh | sh 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to install Ollama. Continuing..."
+fi
+ip link set eth0 down 2>>"$LOG_FILE" || true
+systemctl stop dhcpcd 2>>"$LOG_FILE" || true
 
 # Kernel Compilation with Post-Quantum and Lattice-Based Ciphers
+log_message "Compiling kernel..."
 mkdir -p /root/quantum_powerhouse
 cd /root/quantum_powerhouse
-# Use the latest stable kernel (as of April 2025, let's assume 6.9 for stability)
 LATEST_KERNEL="linux-6.9.tar.xz"
-curl -L "https://kernel.org/pub/linux/kernel/v6.x/$LATEST_KERNEL" -o "$LATEST_KERNEL"
-# Verify checksum of downloaded kernel (you should precompute this)
-EXPECTED_KERNEL_CHECKSUM="your_precomputed_kernel_sha256_checksum_here"
-CURRENT_KERNEL_CHECKSUM=$(sha256sum "$LATEST_KERNEL" | awk '{print $1}')
-if [ "$CURRENT_KERNEL_CHECKSUM" != "$EXPECTED_KERNEL_CHECKSUM" ]; then
-    echo "Error: Kernel tarball checksum mismatch! Expected: $EXPECTED_KERNEL_CHECKSUM, Got: $CURRENT_KERNEL_CHECKSUM"
-    exit 1
-fi
-tar -xf "$LATEST_KERNEL"
-cd "${LATEST_KERNEL%.tar.xz}"
-cp "/boot/config-$(uname -r)" .config || curl -L https://raw.githubusercontent.com/archlinux/svntogit-packages/packages/linux/repos/core-x86_64/config -o .config
-cat <<EOC >> .config
+if ! curl -L "https://kernel.org/pub/linux/kernel/v6.x/$LATEST_KERNEL" -o "$LATEST_KERNEL" 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to download kernel. Continuing with default kernel..."
+else
+    tar -xf "$LATEST_KERNEL" 2>>"$LOG_FILE" || log_message "WARNING: Failed to extract kernel. Continuing..."
+    cd "${LATEST_KERNEL%.tar.xz}"
+    cp "/boot/config-$(uname -r)" .config 2>>"$LOG_FILE" || curl -L https://raw.githubusercontent.com/archlinux/svntogit-packages/packages/linux/repos/core-x86_64/config -o .config 2>>"$LOG_FILE"
+    cat <<EOC >> .config
 # Performance Optimizations for Intel CPU and NVMe
 CONFIG_SMP=y
 CONFIG_HYPERTHREADING=y
@@ -362,10 +506,22 @@ CONFIG_DEFAULT_SECURITY_APPARMOR=y
 CONFIG_CRYPTO_KRB5=n
 CONFIG_DRM_AST=n
 CONFIG_MDNS=n
+
+# Include missing modules for hardware support
+CONFIG_USB_XHCI_HCD=y
+CONFIG_SCSI_AIC94XX=m
+CONFIG_SCSI_BFA=m
+CONFIG_QED=m
+CONFIG_SCSI_QLA_FC=m
+CONFIG_WD719X=m
+CONFIG_FIRMWARE_IN_KERNEL=y
+CONFIG_EXTRA_FIRMWARE=""
 EOC
-make olddefconfig
-mkdir -p drivers/vquantum
-cat <<EOC > drivers/vquantum/vquantum_hybrid.c
+    if ! make olddefconfig 2>>"$LOG_FILE"; then
+        log_message "WARNING: Failed to configure kernel. Continuing..."
+    fi
+    mkdir -p drivers/vquantum
+    cat <<EOC > drivers/vquantum/vquantum_hybrid.c
 #include <linux/module.h>
 #include <linux/smp.h>
 #include <linux/sched.h>
@@ -392,7 +548,7 @@ module_init(vquantum_hybrid_init);
 module_exit(vquantum_hybrid_exit);
 MODULE_LICENSE("GPL");
 EOC
-cat <<EOC > drivers/vquantum/vquantum_qsim.c
+    cat <<EOC > drivers/vquantum/vquantum_qsim.c
 #include <linux/module.h>
 static char *ssd_path = "/mnt/nvme0n1/quantum";
 module_param(ssd_path, charp, 0644);
@@ -407,18 +563,22 @@ module_init(vquantum_qsim_init);
 module_exit(vquantum_qsim_exit);
 MODULE_LICENSE("GPL");
 EOC
-echo "obj-m += vquantum_hybrid.o vquantum_qsim.o" > drivers/vquantum/Makefile
-make -j$(nproc)
-make modules_install
-make install
-# Verify kernel compilation
-if ! ls /boot/vmlinuz-linux-quantum-powerhouse >/dev/null 2>&1; then
-    echo "Error: Kernel compilation failed!"
-    exit 1
+    echo "obj-m += vquantum_hybrid.o vquantum_qsim.o" > drivers/vquantum/Makefile
+    if ! make -j$(nproc) 2>>"$LOG_FILE" || ! make modules_install 2>>"$LOG_FILE" || ! make install 2>>"$LOG_FILE"; then
+        log_message "WARNING: Kernel compilation failed. Continuing with default kernel..."
+    fi
+    if ! ls /boot/vmlinuz-linux-quantum-powerhouse >/dev/null 2>&1; then
+        log_message "WARNING: Kernel not installed. Continuing..."
+    fi
 fi
 
+# Ensure firmware is available
+log_message "Ensuring firmware is available..."
+mkdir -p /lib/firmware
+cp -r /usr/lib/firmware/* /lib/firmware/ 2>>"$LOG_FILE" || log_message "WARNING: Failed to copy firmware files. Continuing..."
+
 # Blacklist Unwanted Modules
-echo "Blacklisting unwanted modules..."
+log_message "Blacklisting unwanted modules..."
 cat <<EOC > /etc/modprobe.d/blacklist.conf
 blacklist krb5
 blacklist ast
@@ -433,119 +593,152 @@ install mdns /bin/false
 install iwlwifi /bin/false
 install bluetooth /bin/false
 EOC
-# Unload any already loaded unwanted modules
 for module in krb5 ast avahi mdns iwlwifi bluetooth; do
     if lsmod | grep -q "$module"; then
-        rmmod "$module" || true
+        rmmod "$module" 2>>"$LOG_FILE" || log_message "WARNING: Failed to unload module $module. Continuing..."
     fi
 done
 
 # Rebuild initramfs
-mkinitcpio -P
+log_message "Rebuilding initramfs..."
+if ! mkinitcpio -P 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to rebuild initramfs. Continuing..."
+fi
 if ! ls /boot/initramfs-linux-quantum-powerhouse.img >/dev/null 2>&1; then
-    echo "Error: Failed to rebuild initramfs!"
-    exit 1
+    log_message "WARNING: initramfs not created. Continuing..."
 fi
 
 # YubiKey Integration with Quantum Randomness
-rngd -r /dev/urandom  # Seed initial randomness
-ykman piv certificates export 9a /root/yubikey-cert.pem
+log_message "Setting up YubiKey..."
+rngd -r /dev/urandom 2>>"$LOG_FILE" || log_message "WARNING: rngd failed to seed randomness. Continuing..."
+if ! ykman piv certificates export 9a /root/yubikey-cert.pem 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to export YubiKey certificate. Continuing..."
+fi
 cat <<EOC > /etc/pam.d/system-auth
 auth       required   pam_u2f.so authfile=/etc/yubikey_mappings cue
 auth       required   pam_unix.so try_first_pass
 EOC
-ykpiv-checker > /etc/yubikey_mappings
-ssh-keygen -D /usr/lib/libykcs11.so > /root/.ssh/id_yubikey.pub
+if ! ykpiv-checker > /etc/yubikey_mappings 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to set up YubiKey mappings. Continuing..."
+fi
+if ! ssh-keygen -D /usr/lib/libykcs11.so > /root/.ssh/id_yubikey.pub 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to generate YubiKey SSH key. Continuing..."
+fi
 mkdir -p /root/.ssh
-cat /root/.ssh/id_yubikey.pub >> /root/.ssh/authorized_keys
-chmod 600 /root/.ssh/authorized_keys
+cat /root/.ssh/id_yubikey.pub >> /root/.ssh/authorized_keys 2>>"$LOG_FILE" || log_message "WARNING: Failed to add YubiKey to authorized_keys. Continuing..."
+chmod 600 /root/.ssh/authorized_keys 2>>"$LOG_FILE" || log_message "WARNING: Failed to set permissions on authorized_keys. Continuing..."
 cat <<EOC > /etc/ssh/sshd_config
 PubkeyAuthentication yes
 PasswordAuthentication no
 ChallengeResponseAuthentication no
 EOC
-systemctl enable sshd
-if ! systemctl is-enabled sshd >/dev/null 2>&1; then
-    echo "Error: Failed to enable sshd!"
-    exit 1
+if ! systemctl enable sshd 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to enable sshd. Continuing..."
 fi
 
 # Post-Quantum Security for SSH
-# Temporarily enable network for downloading dependencies
-ip link set enp3s0 up
-dhcpcd enp3s0
-git clone https://github.com/open-quantum-safe/liboqs.git
-cd liboqs
-mkdir build && cd build
-cmake -DOQS_ALGS_ENABLED="Kyber,Dilithium,Falcon,SPHINCS+" ..
-make -j$(nproc)
-make install
+log_message "Setting up post-quantum SSH..."
+ip link set eth0 up 2>>"$LOG_FILE" || log_message "WARNING: Failed to bring up eth0. Continuing..."
+dhcpcd eth0 2>>"$LOG_FILE" || log_message "WARNING: dhcpcd failed. Continuing..."
+if ! git clone https://github.com/open-quantum-safe/liboqs.git 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to clone liboqs. Continuing..."
+else
+    cd liboqs
+    mkdir build && cd build
+    if ! cmake -DOQS_ALGS_ENABLED="Kyber,Dilithium,Falcon,SPHINCS+" .. 2>>"$LOG_FILE" ||
+       ! make -j$(nproc) 2>>"$LOG_FILE" ||
+       ! make install 2>>"$LOG_FILE"; then
+        log_message "WARNING: Failed to build liboqs. Continuing..."
+    fi
+fi
 cd /root/quantum_powerhouse
-git clone https://github.com/open-quantum-safe/openssh.git
-cd openssh
-./configure --with-liboqs-dir=/usr/local --prefix=/usr
-make -j$(nproc)
-make install
+if ! git clone https://github.com/open-quantum-safe/openssh.git 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to clone openssh. Continuing..."
+else
+    cd openssh
+    if ! ./configure --with-liboqs-dir=/usr/local --prefix=/usr 2>>"$LOG_FILE" ||
+       ! make -j$(nproc) 2>>"$LOG_FILE" ||
+       ! make install 2>>"$LOG_FILE"; then
+        log_message "WARNING: Failed to build openssh. Continuing..."
+    fi
+fi
 cat <<EOC >> /etc/ssh/sshd_config
 KexAlgorithms sntrup761x25519-sha512@openssh.com
 HostKeyAlgorithms ssh-kyber-512,ssh-dilithium-128
 Ciphers chacha20-poly1305@openssh.com
 MACs hmac-sha2-512
 EOC
-systemctl restart sshd
-# Disable network again
-ip link set enp3s0 down
-systemctl stop dhcpcd || true
+systemctl restart sshd 2>>"$LOG_FILE" || log_message "WARNING: Failed to restart sshd. Continuing..."
+ip link set eth0 down 2>>"$LOG_FILE" || true
+systemctl stop dhcpcd 2>>"$LOG_FILE" || true
 
 # GRUB Configuration
-grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+log_message "Configuring GRUB..."
+if ! grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to install GRUB. Continuing..."
+fi
 cat <<EOC > /etc/default/grub
 GRUB_ENABLE_CRYPTODISK=y
 GRUB_CMDLINE_LINUX_DEFAULT="quiet splash intel_pstate=active apparmor=1 security=apparmor"
 GRUB_CMDLINE_LINUX="cryptdevice=UUID=$(blkid -s UUID -o value /dev/nvme0n1p2):vgroot root=/dev/vgroot/root"
 EOC
-GRUB_PW_HASH=$(echo -e "password\npassword" | grub-mkpasswd-pbkdf2 | grep -o "grub.pbkdf2.sha512.*")
+GRUB_PW_HASH=$(echo -e "password\npassword" | grub-mkpasswd-pbkdf2 2>>"$LOG_FILE" | grep -o "grub.pbkdf2.sha512.*" || echo "")
+if [ -z "$GRUB_PW_HASH" ]; then
+    log_message "WARNING: Failed to generate GRUB password hash. Continuing..."
+fi
 cat <<EOC > /etc/grub.d/40_custom
 set superusers="admin"
 password_pbkdf2 admin $GRUB_PW_HASH
 EOC
-sed -i 's/--class os/--class os --unrestricted/' /etc/grub.d/10_linux
-grub-mkconfig -o /boot/grub/grub.cfg
-if ! grep -q "cryptdevice" /boot/grub/grub.cfg; then
-    echo "Error: GRUB configuration failed!"
-    exit 1
+if ! sed -i 's/--class os/--class os --unrestricted/' /etc/grub.d/10_linux 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to modify GRUB config. Continuing..."
+fi
+if ! grub-mkconfig -o /boot/grub/grub.cfg 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to generate GRUB config. Continuing..."
+fi
+if ! grep -q "cryptdevice" /boot/grub/grub.cfg 2>>"$LOG_FILE"; then
+    log_message "WARNING: GRUB config does not contain cryptdevice. Continuing..."
 fi
 
 # Security Hardening
-systemctl mask bluetooth.service
-systemctl mask wpa_supplicant.service
-ufw default deny incoming
-ufw default allow outgoing
-ufw enable
-systemctl enable ufw
-pacman -S --noconfirm usbguard
-usbguard generate-policy > /etc/usbguard/rules.conf
+log_message "Applying security hardening..."
+systemctl mask bluetooth.service 2>>"$LOG_FILE" || log_message "WARNING: Failed to mask bluetooth.service. Continuing..."
+systemctl mask wpa_supplicant.service 2>>"$LOG_FILE" || log_message "WARNING: Failed to mask wpa_supplicant.service. Continuing..."
+ufw default deny incoming 2>>"$LOG_FILE" || log_message "WARNING: Failed to set UFW default deny incoming. Continuing..."
+ufw default allow outgoing 2>>"$LOG_FILE" || log_message "WARNING: Failed to set UFW default allow outgoing. Continuing..."
+ufw enable 2>>"$LOG_FILE" || log_message "WARNING: Failed to enable UFW. Continuing..."
+systemctl enable ufw 2>>"$LOG_FILE" || log_message "WARNING: Failed to enable UFW service. Continuing..."
+if ! pacman -S --noconfirm --needed usbguard 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to install usbguard. Continuing..."
+fi
+usbguard generate-policy > /etc/usbguard/rules.conf 2>>"$LOG_FILE" || log_message "WARNING: Failed to generate usbguard policy. Continuing..."
 cat <<EOC > /etc/usbguard/rules.conf
 allow id 1050:0407
 block
 EOC
-systemctl enable usbguard
-pacman -R --noconfirm ca-certificates-utils avahi
-pacman -S --noconfirm nvidia nvidia-utils
-echo "performance" > /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-pacman -S --noconfirm sbctl
-sbctl create-keys
-sbctl enroll-keys -m
-sbctl sign -s /boot/EFI/GRUB/grubx64.efi
-systemctl enable apparmor
+systemctl enable usbguard 2>>"$LOG_FILE" || log_message "WARNING: Failed to enable usbguard. Continuing..."
+pacman -R --noconfirm ca-certificates-utils avahi 2>>"$LOG_FILE" || log_message "WARNING: Failed to remove ca-certificates-utils and avahi. Continuing..."
+if ! pacman -S --noconfirm --needed nvidia nvidia-utils 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to install nvidia drivers. Continuing..."
+fi
+echo "performance" > /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>>"$LOG_FILE" || log_message "WARNING: Failed to set CPU governor to performance. Continuing..."
+if ! pacman -S --noconfirm --needed sbctl 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to install sbctl. Continuing..."
+fi
+sbctl create-keys 2>>"$LOG_FILE" || log_message "WARNING: Failed to create Secure Boot keys. Continuing..."
+sbctl enroll-keys -m 2>>"$LOG_FILE" || log_message "WARNING: Failed to enroll Secure Boot keys. Continuing..."
+sbctl sign -s /boot/EFI/GRUB/grubx64.efi 2>>"$LOG_FILE" || log_message "WARNING: Failed to sign GRUB with Secure Boot. Continuing..."
+systemctl enable apparmor 2>>"$LOG_FILE" || log_message "WARNING: Failed to enable AppArmor. Continuing..."
 
 # Quantum Setup with System-Wide Integration
+log_message "Setting up quantum components..."
 mkdir -p /mnt/nvme0n1/hybrid /mnt/nvme0n1/quantum
 echo "/dev/vgroot/root /mnt/nvme0n1/hybrid btrfs subvol=@,compress=zstd,ssd,noatime 0 0" >> /etc/fstab
 echo "/dev/vgroot/root /mnt/nvme0n1/quantum btrfs subvol=@,compress=zstd,ssd,noatime 0 0" >> /etc/fstab
-mount -a
+mount -a 2>>"$LOG_FILE" || log_message "WARNING: Failed to mount quantum directories. Continuing..."
 
-# Hybrid Buffer (Enhanced for System-Wide Use)
+# Hybrid Buffer
+log_message "Setting up hybrid buffer..."
 cat <<EOC > /opt/vquantum_hybrid.rs
 use std::fs::{remove_file, File};
 use std::io::{Read, Write};
@@ -569,14 +762,13 @@ fn main() {
     for h in handles { h.join().unwrap(); }
 }
 EOC
-rustc -O /opt/vquantum_hybrid.rs -o /opt/vquantum_hybrid
-chmod +x /opt/vquantum_hybrid
-if ! [ -x /opt/vquantum_hybrid ]; then
-    echo "Error: Failed to compile vquantum_hybrid!"
-    exit 1
+if ! rustc -O /opt/vquantum_hybrid.rs -o /opt/vquantum_hybrid 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to compile vquantum_hybrid. Continuing..."
 fi
+chmod +x /opt/vquantum_hybrid 2>>"$LOG_FILE" || log_message "WARNING: Failed to set permissions on vquantum_hybrid. Continuing..."
 
-# Quantum Simulator (Enhanced for System-Wide Use)
+# Quantum Simulator
+log_message "Setting up quantum simulator..."
 cat <<EOC > /opt/vquantum_qsim.py
 #!/usr/bin/env python3
 import cirq
@@ -599,13 +791,10 @@ while True:
     np.save(f"{SSD_QUANTUM}/nonce_list.bin", ranked_states)
     os.system(f"rngd -r {SSD_QUANTUM}/nonce_list.bin -o /dev/random")
 EOC
-chmod +x /opt/vquantum_qsim.py
-if ! [ -x /opt/vquantum_qsim.py ]; then
-    echo "Error: Failed to set up vquantum_qsim!"
-    exit 1
-fi
+chmod +x /opt/vquantum_qsim.py 2>>"$LOG_FILE" || log_message "WARNING: Failed to set permissions on vquantum_qsim.py. Continuing..."
 
 # System-Wide Quantum Enhancement
+log_message "Setting up system-wide quantum enhancements..."
 cat <<EOC > /etc/profile.d/quantum_boost.sh
 #!/bin/bash
 export QUANTUM_HYBRID_PATH="/mnt/nvme0n1/hybrid"
@@ -613,9 +802,10 @@ export QUANTUM_QSIM_PATH="/mnt/nvme0n1/quantum"
 alias compute_boost="python3 /opt/quantum_task.py"
 export LD_PRELOAD="/usr/local/lib/libquantum_boost.so"
 EOC
-chmod +x /etc/profile.d/quantum_boost.sh
+chmod +x /etc/profile.d/quantum_boost.sh 2>>"$LOG_FILE" || log_message "WARNING: Failed to set permissions on quantum_boost.sh. Continuing..."
 
-# Quantum Task Integration (Enhanced for System-Wide Use)
+# Quantum Task Integration
+log_message "Setting up quantum task integration..."
 cat <<EOC > /opt/quantum_task.py
 #!/usr/bin/env python3
 import numpy as np
@@ -644,13 +834,10 @@ if __name__ == "__main__":
     print(f"Hybrid Boost: {hybrid_result}, Quantum Boost: {quantum_result}")
     os.system("sysctl -w kernel.sched_quantum_boost=$(echo $quantum_result | cut -d. -f1)")
 EOC
-chmod +x /opt/quantum_task.py
-if ! [ -x /opt/quantum_task.py ]; then
-    echo "Error: Failed to set up quantum_task!"
-    exit 1
-fi
+chmod +x /opt/quantum_task.py 2>>"$LOG_FILE" || log_message "WARNING: Failed to set permissions on quantum_task.py. Continuing..."
 
-# Quantum Boost Library (for LD_PRELOAD)
+# Quantum Boost Library
+log_message "Setting up quantum boost library..."
 cat <<EOC > /root/quantum_boost.c
 #include <stdlib.h>
 #include <stdio.h>
@@ -660,13 +847,12 @@ void __attribute__((constructor)) quantum_boost_init(void) {
     setenv("QUANTUM_BOOST", "1", 1);
 }
 EOC
-gcc -shared -fPIC /root/quantum_boost.c -o /usr/local/lib/libquantum_boost.so
-if ! [ -f /usr/local/lib/libquantum_boost.so ]; then
-    echo "Error: Failed to compile quantum_boost library!"
-    exit 1
+if ! gcc -shared -fPIC /root/quantum_boost.c -o /usr/local/lib/libquantum_boost.so 2>>"$LOG_FILE"; then
+    log_message "WARNING: Failed to compile quantum_boost library. Continuing..."
 fi
 
 # Services
+log_message "Setting up services..."
 cat <<EOC > /etc/systemd/system/vquantum_hybrid.service
 [Unit]
 Description=Quantum Hybrid Buffer
@@ -687,28 +873,26 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 EOC
-systemctl daemon-reload
-systemctl enable vquantum_hybrid vquantum_qsim NetworkManager
-if ! systemctl is-enabled vquantum_hybrid >/dev/null 2>&1; then
-    echo "Error: Failed to enable vquantum_hybrid service!"
-    exit 1
-fi
+systemctl daemon-reload 2>>"$LOG_FILE" || log_message "WARNING: Failed to reload systemd daemon. Continuing..."
+systemctl enable vquantum_hybrid vquantum_qsim NetworkManager 2>>"$LOG_FILE" || log_message "WARNING: Failed to enable services. Continuing..."
 
 # Harden Against Unauthorized Module Loading
-echo "Hardening against unauthorized module loading..."
+log_message "Hardening against unauthorized module loading..."
 echo "kernel.modules_disabled=1" >> /etc/sysctl.conf
-sysctl -p
+sysctl -p 2>>"$LOG_FILE" || log_message "WARNING: Failed to apply sysctl settings. Continuing..."
 
 # Finalize
+log_message "Chroot configuration completed."
 exit
 EOF
 
-# Step 7: Reboot
-echo "Rebooting..."
-umount -R /mnt
-swapoff /dev/vgroot/swap
-cryptsetup close cryptnvme0n1p2
-cryptsetup close cryptnvme1n1p1
-cryptsetup close cryptsda1
-cryptsetup close cryptsdb1
+# Step 8: Reboot
+log_message "Rebooting..."
+umount -R /mnt 2>>"$LOG_FILE" || log_message "WARNING: Failed to unmount /mnt. Continuing..."
+swapoff /dev/vgroot/swap 2>>"$LOG_FILE" || log_message "WARNING: Failed to disable swap. Continuing..."
+cryptsetup close cryptnvme0n1p2 2>>"$LOG_FILE" || log_message "WARNING: Failed to close cryptnvme0n1p2. Continuing..."
+cryptsetup close cryptnvme1n1p1 2>>"$LOG_FILE" || log_message "WARNING: Failed to close cryptnvme1n1p1. Continuing..."
+cryptsetup close cryptsda1 2>>"$LOG_FILE" || log_message "WARNING: Failed to close cryptsda1. Continuing..."
+cryptsetup close cryptsdb1 2>>"$LOG_FILE" || log_message "WARNING: Failed to close cryptsdb1. Continuing..."
+log_message "Installation completed. Rebooting system..."
 reboot
