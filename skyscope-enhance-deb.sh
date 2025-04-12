@@ -28,7 +28,7 @@ NETWORK_DEVICE=$(ip link | grep -oP '^[0-9]+: \K(en[^:]+)' | head -1)
 ANACONDA_PATH="/home/$USERNAME/anaconda3"
 IDENTITY_DIR="/home/$USERNAME/storj/identity/storagenode"
 BOOTLOADER_PASSWORD="quantum2025" # Change post-install
-LOGO_URL="https://raw.githubusercontent.com/skyscope-sentinel/assets/main/plasmoid_orb.png"
+LOGO_URL="https://raw.githubusercontent.com/skyscope-sentinel/SecureLinux/plasmoid_orb.png"
 LOGO_PATH="/boot/grub/plasmoid_orb.png"
 
 # Function to log messages
